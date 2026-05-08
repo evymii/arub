@@ -1,0 +1,54 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime   @default(now())
+
+  buildings    Building[]
+  samples      Sample[]
+}
+
+model Building {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  lat         Float?
+  lng         Float?
+  createdAt   DateTime @default(now())
+
+  createdBy   User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+
+  samples     Sample[]
+
+  @@index([lat, lng])
+}
+
+model Sample {
+  id            String   @id @default(cuid())
+  buildingId    String
+  building      Building @relation(fields: [buildingId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+
+  embedding     String   // JSON-encoded float[] (SQLite has no native arrays)
+  lat           Float?
+  lng           Float?
+  source        String   // "camera" | "photo"
+
+  photoUrl      String?
+  photoPublicId String?
+
+  createdAt     DateTime @default(now())
+
+  @@index([buildingId])
+  @@index([userId])
+}

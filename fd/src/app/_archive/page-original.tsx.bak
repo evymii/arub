@@ -1,0 +1,474 @@
+"use client";
+
+import {
+  Building2,
+  Camera,
+  Compass,
+  LocateFixed,
+  MapPin,
+  Navigation,
+  ScanSearch,
+  Search,
+  Sparkles,
+  Store,
+  Utensils,
+} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+type Business = {
+  name: string;
+  floor: string;
+  category: string;
+  logo: string;
+  highlight: string;
+};
+
+type Building = {
+  id: string;
+  name: string;
+  subtitle: string;
+  category: string;
+  lat: number;
+  lng: number;
+  bearing: number;
+  distanceFallback: number;
+  entrance: string;
+  recognition: number;
+  color: string;
+  businesses: Business[];
+};
+
+type LocationState = {
+  lat: number;
+  lng: number;
+  accuracy: number;
+};
+
+const buildings: Building[] = [
+  {
+    id: "blue-sky",
+    name: "Blue Sky Tower",
+    subtitle: "Hotel, restaurants, offices",
+    category: "Mixed use",
+    lat: 47.9187,
+    lng: 106.9177,
+    bearing: 18,
+    distanceFallback: 140,
+    entrance: "South entrance near the main road",
+    recognition: 91,
+    color: "bg-cyan-500",
+    businesses: [
+      {
+        name: "Sky Lounge",
+        floor: "23F",
+        category: "Restaurant",
+        logo: "SL",
+        highlight: "City view dining",
+      },
+      {
+        name: "Nomad Coffee",
+        floor: "1F",
+        category: "Cafe",
+        logo: "NC",
+        highlight: "Quick breakfast",
+      },
+      {
+        name: "Travel Desk",
+        floor: "Lobby",
+        category: "Tour service",
+        logo: "TD",
+        highlight: "Local guides",
+      },
+    ],
+  },
+  {
+    id: "central-museum",
+    name: "Central Culture Museum",
+    subtitle: "Exhibits, ticket desk, gift shop",
+    category: "Museum",
+    lat: 47.9195,
+    lng: 106.9142,
+    bearing: 322,
+    distanceFallback: 220,
+    entrance: "Main steps facing the square",
+    recognition: 86,
+    color: "bg-emerald-500",
+    businesses: [
+      {
+        name: "History Hall",
+        floor: "2F",
+        category: "Exhibit",
+        logo: "HH",
+        highlight: "Mongolian heritage",
+      },
+      {
+        name: "Museum Shop",
+        floor: "1F",
+        category: "Souvenirs",
+        logo: "MS",
+        highlight: "Local crafts",
+      },
+      {
+        name: "Audio Guide",
+        floor: "Ticket desk",
+        category: "Visitor help",
+        logo: "AG",
+        highlight: "English available",
+      },
+    ],
+  },
+  {
+    id: "garden-place",
+    name: "Garden Place Center",
+    subtitle: "Retail, food court, services",
+    category: "Shopping",
+    lat: 47.9169,
+    lng: 106.9206,
+    bearing: 104,
+    distanceFallback: 310,
+    entrance: "West entrance beside the park path",
+    recognition: 78,
+    color: "bg-amber-500",
+    businesses: [
+      {
+        name: "Steppe Market",
+        floor: "B1",
+        category: "Market",
+        logo: "SM",
+        highlight: "Snacks and essentials",
+      },
+      {
+        name: "Urban Food Hall",
+        floor: "3F",
+        category: "Food court",
+        logo: "UF",
+        highlight: "Fast local meals",
+      },
+      {
+        name: "SIM & Exchange",
+        floor: "1F",
+        category: "Travel service",
+        logo: "SE",
+        highlight: "Useful for visitors",
+      },
+    ],
+  },
+];
+
+function toRadians(value: number) {
+  return (value * Math.PI) / 180;
+}
+
+function distanceMeters(a: LocationState | null, building: Building) {
+  if (!a) return building.distanceFallback;
+
+  const earthRadius = 6371000;
+  const deltaLat = toRadians(building.lat - a.lat);
+  const deltaLng = toRadians(building.lng - a.lng);
+  const lat1 = toRadians(a.lat);
+  const lat2 = toRadians(building.lat);
+  const value =
+    Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+    Math.cos(lat1) *
+      Math.cos(lat2) *
+      Math.sin(deltaLng / 2) *
+      Math.sin(deltaLng / 2);
+
+  return Math.round(
+    earthRadius * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value)),
+  );
+}
+
+function normalizeDegrees(value: number) {
+  return ((value % 360) + 360) % 360;
+}
+
+function relativeBearing(buildingBearing: number, heading: number) {
+  const difference = normalizeDegrees(buildingBearing - heading);
+  return difference > 180 ? difference - 360 : difference;
+}
+
+export default function Home() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const [location, setLocation] = useState<LocationState | null>(null);
+  const [locationStatus, setLocationStatus] = useState("Waiting for GPS");
+  const [heading, setHeading] = useState(24);
+  const [selectedId, setSelectedId] = useState(buildings[0].id);
+  const [query, setQuery] = useState("");
+  const [scanMode, setScanMode] = useState<"nearby" | "recognition">("nearby");
+
+  const selected = buildings.find((building) => building.id === selectedId) ?? buildings[0];
+
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          setCameraReady(true);
+        }
+      } catch {
+        setCameraError("Camera permission is needed for the AR street view.");
+      }
+    }
+
+    startCamera();
+
+    return () => {
+      stream?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!navigator.geolocation) {
+      window.setTimeout(
+        () => setLocationStatus("GPS is not available in this browser"),
+        0,
+      );
+      return;
+    }
+
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        setLocation({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          accuracy: Math.round(position.coords.accuracy),
+        });
+        setLocationStatus("Live location");
+      },
+      () => setLocationStatus("Using demo distances"),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 },
+    );
+
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, []);
+
+  useEffect(() => {
+    function handleOrientation(event: DeviceOrientationEvent) {
+      const webkitCompassHeading =
+        "webkitCompassHeading" in event
+          ? Number(event.webkitCompassHeading)
+          : undefined;
+      const nextHeading =
+        webkitCompassHeading ?? (event.alpha ? 360 - event.alpha : undefined);
+
+      if (typeof nextHeading === "number" && Number.isFinite(nextHeading)) {
+        setHeading(Math.round(normalizeDegrees(nextHeading)));
+      }
+    }
+
+    window.addEventListener("deviceorientation", handleOrientation, true);
+    return () => window.removeEventListener("deviceorientation", handleOrientation, true);
+  }, []);
+
+  const visibleBuildings = useMemo(() => {
+    return buildings
+      .map((building) => {
+        const relative = relativeBearing(building.bearing, heading);
+        const distance = distanceMeters(location, building);
+        const confidence =
+          scanMode === "recognition"
+            ? building.recognition
+            : Math.max(42, 96 - Math.abs(relative));
+
+        return {
+          ...building,
+          relative,
+          distance,
+          confidence,
+          x: Math.min(86, Math.max(14, 50 + relative * 0.9)),
+          y: 31 + Math.min(28, distance / 22),
+        };
+      })
+      .sort((a, b) => b.confidence - a.confidence);
+  }, [heading, location, scanMode]);
+
+  const filteredBusinesses = selected.businesses.filter((business) => {
+    const haystack = `${business.name} ${business.category} ${business.floor}`.toLowerCase();
+    return haystack.includes(query.toLowerCase());
+  });
+
+  return (
+    <main className="min-h-screen bg-neutral-950 text-white">
+      <section className="relative min-h-screen overflow-hidden">
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          className="absolute inset-0 h-full w-full object-cover opacity-80"
+        />
+        <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(5,8,10,0.2),rgba(5,8,10,0.74))]" />
+        {!cameraReady && (
+          <div className="absolute inset-0 bg-neutral-900">
+            <div className="flex h-full items-center justify-center px-6 text-center">
+              <div className="max-w-sm">
+                <Camera className="mx-auto mb-4 h-10 w-10 text-cyan-300" />
+                <h1 className="text-2xl font-semibold">AR city guide</h1>
+                <p className="mt-3 text-sm leading-6 text-neutral-300">
+                  {cameraError || "Starting camera and preparing nearby building overlays."}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="absolute left-0 right-0 top-0 z-10 flex items-center justify-between gap-3 px-4 py-4 sm:px-6">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-[0.22em] text-cyan-200">
+              Visitor AR
+            </p>
+            <h1 className="text-xl font-semibold sm:text-3xl">Find what is inside</h1>
+          </div>
+          <div className="flex items-center gap-2 rounded-md bg-black/50 px-3 py-2 text-sm backdrop-blur">
+            <Compass className="h-4 w-4 text-cyan-200" />
+            <span>{heading}°</span>
+          </div>
+        </div>
+
+        <div className="absolute inset-0 z-10">
+          {visibleBuildings.map((building) => (
+            <button
+              key={building.id}
+              type="button"
+              onClick={() => setSelectedId(building.id)}
+              className={`absolute w-52 -translate-x-1/2 rounded-md border px-3 py-2 text-left shadow-2xl backdrop-blur transition ${
+                selectedId === building.id
+                  ? "border-cyan-200 bg-black/75"
+                  : "border-white/15 bg-black/50 hover:bg-black/65"
+              }`}
+              style={{ left: `${building.x}%`, top: `${building.y}%` }}
+            >
+              <div className="flex items-start gap-2">
+                <span className={`mt-1 h-3 w-3 shrink-0 rounded-full ${building.color}`} />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-semibold">{building.name}</span>
+                  <span className="block truncate text-xs text-neutral-300">
+                    {building.distance}m · {building.category}
+                  </span>
+                </span>
+              </div>
+              <div className="mt-2 h-1.5 rounded-full bg-white/15">
+                <div
+                  className="h-full rounded-full bg-cyan-300"
+                  style={{ width: `${building.confidence}%` }}
+                />
+              </div>
+            </button>
+          ))}
+        </div>
+
+        <div className="absolute bottom-0 left-0 right-0 z-20 grid gap-4 p-4 sm:grid-cols-[1fr_380px] sm:p-6">
+          <div className="self-end rounded-md border border-white/15 bg-black/58 p-3 backdrop-blur">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setScanMode("nearby")}
+                className={`inline-flex h-10 items-center gap-2 rounded-md px-3 text-sm font-medium ${
+                  scanMode === "nearby" ? "bg-white text-neutral-950" : "bg-white/10 text-white"
+                }`}
+              >
+                <LocateFixed className="h-4 w-4" />
+                Nearby
+              </button>
+              <button
+                type="button"
+                onClick={() => setScanMode("recognition")}
+                className={`inline-flex h-10 items-center gap-2 rounded-md px-3 text-sm font-medium ${
+                  scanMode === "recognition" ? "bg-white text-neutral-950" : "bg-white/10 text-white"
+                }`}
+              >
+                <ScanSearch className="h-4 w-4" />
+                Recognize
+              </button>
+              <div className="ml-auto flex items-center gap-2 text-xs text-neutral-300">
+                <MapPin className="h-4 w-4 text-cyan-200" />
+                <span>{locationStatus}</span>
+                {location && <span>±{location.accuracy}m</span>}
+              </div>
+            </div>
+          </div>
+
+          <aside className="rounded-md border border-white/15 bg-neutral-950/88 p-4 shadow-2xl backdrop-blur">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-medium uppercase tracking-[0.18em] text-cyan-200">
+                  {selected.category}
+                </p>
+                <h2 className="mt-1 text-2xl font-semibold leading-7">{selected.name}</h2>
+                <p className="mt-2 text-sm text-neutral-300">{selected.subtitle}</p>
+              </div>
+              <div className={`rounded-md ${selected.color} p-3 text-sm font-bold text-white`}>
+                {selected.recognition}%
+              </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-2 gap-2 text-sm">
+              <div className="rounded-md bg-white/8 p-3">
+                <Navigation className="mb-2 h-4 w-4 text-cyan-200" />
+                <p className="font-medium">{distanceMeters(location, selected)}m away</p>
+                <p className="mt-1 text-xs text-neutral-400">{selected.entrance}</p>
+              </div>
+              <div className="rounded-md bg-white/8 p-3">
+                <Sparkles className="mb-2 h-4 w-4 text-cyan-200" />
+                <p className="font-medium">AI match</p>
+                <p className="mt-1 text-xs text-neutral-400">
+                  GPS, heading, and visual recognition candidate.
+                </p>
+              </div>
+            </div>
+
+            <label className="mt-4 flex h-10 items-center gap-2 rounded-md bg-white px-3 text-neutral-950">
+              <Search className="h-4 w-4 text-neutral-500" />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search inside"
+                className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-neutral-500"
+              />
+            </label>
+
+            <div className="mt-4 space-y-2">
+              {filteredBusinesses.map((business) => (
+                <div
+                  key={business.name}
+                  className="flex items-center gap-3 rounded-md border border-white/10 bg-white/8 p-3"
+                >
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-white text-sm font-bold text-neutral-950">
+                    {business.logo}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      {business.category.includes("Restaurant") ||
+                      business.category.includes("Food") ? (
+                        <Utensils className="h-4 w-4 text-cyan-200" />
+                      ) : business.category.includes("Market") ||
+                        business.category.includes("Cafe") ? (
+                        <Store className="h-4 w-4 text-cyan-200" />
+                      ) : (
+                        <Building2 className="h-4 w-4 text-cyan-200" />
+                      )}
+                      <p className="truncate text-sm font-semibold">{business.name}</p>
+                    </div>
+                    <p className="mt-1 truncate text-xs text-neutral-400">
+                      {business.floor} · {business.category} · {business.highlight}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  );
+}
