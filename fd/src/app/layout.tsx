@@ -1,9 +1,12 @@
 import type { Metadata, Viewport } from "next";
+
+import { I18nProvider } from "@/lib/i18n/context";
+
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Building AR",
-  description: "Mobile web AR that recognizes buildings from any angle.",
+  title: "Scene Detect AR",
+  description: "Mobile web AR that recognizes scenes and objects in real time.",
 };
 
 export const viewport: Viewport = {
@@ -11,7 +14,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   viewportFit: "cover",
-  themeColor: "#0a0a0a",
+  themeColor: "#0b2d72",
 };
 
 export default function RootLayout({
@@ -19,8 +22,8 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className="h-full antialiased">
-      <body className="h-full overscroll-none bg-neutral-950 text-white">
-        {children}
+      <body className="h-full overscroll-none bg-white text-zinc-900 antialiased">
+        <I18nProvider>{children}</I18nProvider>
       </body>
     </html>
   );

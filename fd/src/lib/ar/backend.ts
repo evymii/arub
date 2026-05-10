@@ -3,6 +3,8 @@ export type ApiBuilding = {
   name: string;
   lat: number | null;
   lng: number | null;
+  /** Persisted “not a building” / ¬bldg flag from the API. */
+  isNotBuilding?: boolean;
 };
 
 export type ApiSample = {
@@ -11,6 +13,32 @@ export type ApiSample = {
   lat: number | null;
   lng: number | null;
   source: "camera" | "photo";
+};
+
+export type ApiIssue = {
+  id: string;
+  title: string;
+  description: string | null;
+  status: "open" | "consensus" | "accepted" | "resolved";
+  buildingId: string | null;
+  buildingLabel: string | null;
+  matchCount: number;
+  uniqueUsers: number;
+  supportCount: number;
+  commentCount: number;
+  totalMatchEvents: number;
+  lat: number | null;
+  lng: number | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ApiIssueComment = {
+  id: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+  author: { id: string; name: string | null; email: string };
 };
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
@@ -72,7 +100,7 @@ export async function listBuildings(token: string): Promise<ApiBuilding[]> {
 
 export async function createBuilding(
   token: string,
-  payload: { name: string; lat?: number; lng?: number },
+  payload: { name: string; lat?: number; lng?: number; isNotBuilding?: boolean },
 ): Promise<ApiBuilding> {
   const result = await apiFetch<{ building: ApiBuilding }>("/buildings", {
     method: "POST",
@@ -82,6 +110,25 @@ export async function createBuilding(
     },
     body: JSON.stringify(payload),
   });
+  return result.building;
+}
+
+export async function updateBuilding(
+  token: string,
+  buildingId: string,
+  payload: { isNotBuilding?: boolean },
+): Promise<ApiBuilding & { sampleCount?: number }> {
+  const result = await apiFetch<{ building: ApiBuilding & { sampleCount?: number } }>(
+    `/buildings/${buildingId}`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+  );
   return result.building;
 }
 
@@ -130,12 +177,102 @@ export async function listAllSamplesByBuilding(token: string): Promise<
     samples: ApiSample[];
   }>
 > {
-  const buildings = await listBuildings(token);
-  const perBuilding = await Promise.all(
-    buildings.map(async (building) => ({
-      building,
-      samples: await listBuildingSamples(token, building.id),
-    })),
+  const result = await apiFetch<{
+    buildings: Array<ApiBuilding & { samples: ApiSample[] }>;
+  }>("/buildings/with-samples", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  return result.buildings.map((building) => ({
+    building: {
+      id: building.id,
+      name: building.name,
+      lat: building.lat,
+      lng: building.lng,
+      isNotBuilding: building.isNotBuilding,
+    },
+    samples: building.samples,
+  }));
+}
+
+export async function createIssue(
+  token: string,
+  payload: {
+    title: string;
+    description?: string;
+    buildingId?: string;
+    embedding?: number[];
+    lat?: number;
+    lng?: number;
+  },
+): Promise<ApiIssue> {
+  const metadata = JSON.stringify(payload);
+  const formData = new FormData();
+  formData.set("metadata", metadata);
+  const result = await apiFetch<{ issue: ApiIssue }>("/issues", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+  return result.issue;
+}
+
+export async function getIssueByLabel(token: string, label: string): Promise<ApiIssue | null> {
+  const result = await apiFetch<{ issue: ApiIssue | null }>(
+    `/issues/by-label/${encodeURIComponent(label)}`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    },
   );
-  return perBuilding;
+  return result.issue;
+}
+
+export async function supportIssue(token: string, issueId: string): Promise<ApiIssue | null> {
+  const result = await apiFetch<{ issue: ApiIssue | null }>(`/issues/${issueId}/support`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return result.issue;
+}
+
+export async function recordMatchEvent(
+  token: string,
+  issueId: string,
+  payload: { buildingId: string },
+): Promise<ApiIssue | null> {
+  const result = await apiFetch<{ issue: ApiIssue | null }>(`/issues/${issueId}/match-events`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return result.issue;
+}
+
+export async function listIssueComments(
+  token: string,
+  issueId: string,
+): Promise<ApiIssueComment[]> {
+  const result = await apiFetch<{ comments: ApiIssueComment[] }>(`/issues/${issueId}/comments`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return result.comments;
+}
+
+export async function createIssueComment(
+  token: string,
+  issueId: string,
+  body: string,
+): Promise<ApiIssueComment> {
+  const result = await apiFetch<{ comment: ApiIssueComment }>(`/issues/${issueId}/comments`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ body }),
+  });
+  return result.comment;
 }

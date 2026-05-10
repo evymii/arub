@@ -15,7 +15,14 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
+import { BuildingExperience } from "@/components/ar/BuildingExperience";
+import { HighlightStatsStrip } from "@/components/ar/HighlightStatsStrip";
+import { LanguageSwitcher } from "@/components/ar/LanguageSwitcher";
+import { RecognizeMatchView } from "@/components/ar/RecognizeMatchView";
 import { createEngine, type Engine, type Prediction } from "@/lib/ar/engine";
+import { useI18n } from "@/lib/i18n/context";
+import { type MessageKey } from "@/lib/i18n/dictionaries";
+import { cn } from "@/lib/utils";
 import { extractGpsFromFile } from "@/lib/ar/exif";
 import {
   bearingDegrees,
@@ -27,12 +34,21 @@ import {
   type UserLocation,
 } from "@/lib/ar/geo";
 import {
+  createIssue as createIssueRemote,
+  createIssueComment as createIssueCommentRemote,
   createBuilding as createBuildingRemote,
   createSample as createSampleRemote,
   deleteBuilding as deleteBuildingRemote,
+  getIssueByLabel as getIssueByLabelRemote,
   getOrCreateAuthToken,
   listAllSamplesByBuilding,
   listBuildings as listBuildingsRemote,
+  listIssueComments as listIssueCommentsRemote,
+  recordMatchEvent as recordMatchEventRemote,
+  supportIssue as supportIssueRemote,
+  type ApiIssue,
+  type ApiIssueComment,
+  updateBuilding as updateBuildingRemote,
   type ApiBuilding,
 } from "@/lib/ar/backend";
 import {
@@ -43,6 +59,16 @@ import {
   saveDataset,
   saveMeta,
 } from "@/lib/ar/storage";
+import {
+  effectiveMargin,
+  enrichUiPrediction,
+  isNegativeClassLabel,
+  isNonBuildingSceneLabel,
+  passesRecognitionGate,
+  RECOGNITION_PROFILE_GATES,
+  type RecognitionGate,
+  type UiPrediction,
+} from "@/lib/ar/recognition-policy";
 
 type Mode = "teach" | "recognize";
 type CameraState = "idle" | "starting" | "ready" | "error";
@@ -62,34 +88,26 @@ const MAX_RANGE_M = 400;
 const FOV_HALF_DEG = 32.5;
 // TEMP: disable GPS gating while testing recognition quality/speed.
 const ENABLE_GPS_FEATURES = false;
-const CONSENSUS_WINDOW = 8;
-const CONSENSUS_MIN_VOTES = 5;
-const DEMO_LOCK_MS = 1500;
-const NEGATIVE_LABEL = "NOT_BUILDING";
+/** Frames classifier may disagree before releasing lock while the building stays mostly in frame. */
+const LOCK_GRACE_FRAMES = 4;
 const RECOGNITION_PROFILES = {
-  fast: { label: "Fast", minConfidence: 0.55 },
-  balanced: { label: "Balanced", minConfidence: 0.62 },
-  strict: { label: "Strict", minConfidence: 0.7 },
+  fast: {
+    ...RECOGNITION_PROFILE_GATES.fast,
+    labelKey: "profileFast" satisfies MessageKey,
+  },
+  balanced: {
+    ...RECOGNITION_PROFILE_GATES.balanced,
+    labelKey: "profileBalanced" satisfies MessageKey,
+  },
+  strict: {
+    ...RECOGNITION_PROFILE_GATES.strict,
+    labelKey: "profileStrict" satisfies MessageKey,
+  },
 } as const;
 type RecognitionProfile = keyof typeof RECOGNITION_PROFILES;
 const RECOMMENDED_SAMPLES_PER_BUILDING = 20;
-
-function isNegativeClassLabel(label: string, meta: AllMeta): boolean {
-  if (label === NEGATIVE_LABEL) return true;
-  return meta[label]?.isNegative === true;
-}
-
-function toDisplayPrediction(prediction: Prediction, meta: AllMeta): Prediction | null {
-  if (isNegativeClassLabel(prediction.label, meta)) {
-    return {
-      label: "No building",
-      confidence: 0,
-      confidences: { "No building": 1 },
-      isLowConfidence: false,
-    };
-  }
-  return prediction;
-}
+const CAMERA_MATCH_BADGE_MIN_CONFIDENCE = 0.3;
+const MATCH_REPEAT_TO_SHOW_INFO = 1;
 
 type IosOrientationCtor = {
   requestPermission?: () => Promise<"granted" | "denied" | "default">;
@@ -102,21 +120,24 @@ function getIosOrientationCtor(): IosOrientationCtor | null {
   return ctor ?? null;
 }
 
-function describeCameraError(err: unknown): string {
-  if (!(err instanceof Error)) return "Camera unavailable.";
+function describeCameraError(
+  err: unknown,
+  t: (key: MessageKey, vars?: Record<string, string | number>) => string,
+): string {
+  if (!(err instanceof Error)) return t("cameraUnavailable");
   if (err.name === "NotAllowedError") {
-    return "Camera permission was blocked. Open the lock/camera icon in your browser address bar, allow camera access, then tap Try again.";
+    return t("cameraBlockedPermission");
   }
   if (err.name === "NotFoundError" || err.name === "OverconstrainedError") {
-    return "No usable camera was found on this device.";
+    return t("cameraNoDevice");
   }
   if (err.name === "NotReadableError") {
-    return "Camera is in use by another app. Close it and try again.";
+    return t("cameraInUse");
   }
   if (err.name === "SecurityError") {
-    return "Camera requires HTTPS (or localhost). Reload over a secure URL.";
+    return t("cameraNeedsHttps");
   }
-  return err.message || "Camera unavailable.";
+  return err.message || t("cameraUnavailable");
 }
 
 function loadImageFromFile(
@@ -143,7 +164,32 @@ type Positioned = {
   screenY: number;
 };
 
+function predictionRenderKey(pred: UiPrediction | null): string {
+  if (!pred) return "none";
+  const score = Math.round(pred.confidence * 100);
+  return [
+    pred.label,
+    score,
+    pred.isLowConfidence ? "low" : "ok",
+    pred.isNoBuilding ? "no-scene" : "scene",
+    pred.isNotInDb ? "unknown" : "known",
+  ].join("|");
+}
+
+function isRoadIssueLabel(label: string | null | undefined): boolean {
+  if (!label) return false;
+  const key = label.trim().toLowerCase();
+  return (
+    key.includes("road") ||
+    key.includes("break") ||
+    key.includes("pothole") ||
+    key.includes("zamiin") ||
+    key.includes("зам")
+  );
+}
+
 export default function ARShell() {
+  const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const engineRef = useRef<Engine | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -157,24 +203,37 @@ export default function ARShell() {
   const [engineStatus, setEngineStatus] = useState<"loading" | "ready" | "error">("loading");
   const [engineError, setEngineError] = useState<string | null>(null);
   const [counts, setCounts] = useState<Record<string, number>>({});
-  const [prediction, setPrediction] = useState<Prediction | null>(null);
+  const [prediction, setPrediction] = useState<UiPrediction | null>(null);
+  /** Pinned building for floating GLB sheet; cleared only by “scan again” or leaving Recognize. */
+  const [experienceBuildingLabel, setExperienceBuildingLabel] = useState<string | null>(null);
   const [selectedBuilding, setSelectedBuilding] = useState<string | null>(null);
   const [capture, setCapture] = useState<{ label: string; progress: number } | null>(null);
   const [addingPhotos, setAddingPhotos] = useState<{ current: number; total: number } | null>(null);
   const [recognitionProfile, setRecognitionProfile] = useState<RecognitionProfile>("balanced");
   const [demoLockEnabled, setDemoLockEnabled] = useState(true);
   const [lastInferenceMs, setLastInferenceMs] = useState<number>(0);
+  const inferenceUiLastCommitAtRef = useRef(0);
+  const inferenceUiLastValueRef = useRef(0);
+  const predictionUiKeyRef = useRef<string>("none");
   const [hydrationStatus, setHydrationStatus] = useState<"idle" | "loading" | "done" | "error">(
     "idle",
   );
   const [lockActive, setLockActive] = useState(false);
   const consensusRef = useRef<Array<{ label: string | null; confidence: number }>>([]);
-  const lockUntilRef = useRef(0);
+  /** Classifier label held on screen while Lock is on ("building still in frame"). */
+  const lockHoldLabelRef = useRef<string | null>(null);
+  const lockGraceMissRef = useRef(0);
+  const experienceStreakRef = useRef<{ label: string; passes: number }>({ label: "", passes: 0 });
 
   const [meta, setMeta] = useState<AllMeta>({});
+  const metaRef = useRef<AllMeta>({});
   const [backendReady, setBackendReady] = useState(false);
   const tokenRef = useRef<string | null>(null);
   const buildingByLabelRef = useRef<Record<string, ApiBuilding>>({});
+  const lastRecordedIssueForLabelRef = useRef<string>("");
+  const [activeIssue, setActiveIssue] = useState<ApiIssue | null>(null);
+  const [issueComments, setIssueComments] = useState<ApiIssueComment[]>([]);
+  const [issueBusy, setIssueBusy] = useState(false);
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
   const [locationStatus, setLocationStatus] = useState<LocationStatus>(() => {
     if (!ENABLE_GPS_FEATURES) return "idle";
@@ -211,12 +270,12 @@ export default function ARShell() {
           audio: false,
         });
       } catch (e) {
-        setCameraError(describeCameraError(e));
+        setCameraError(describeCameraError(e, t));
         setCameraState("error");
         return;
       }
 
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = newStream;
       if (videoRef.current) {
         videoRef.current.srcObject = newStream;
@@ -225,7 +284,7 @@ export default function ARShell() {
       setFacing(facingTarget);
       setCameraState("ready");
     },
-    [cameraState, facing],
+    [cameraState, facing, t],
   );
 
   const switchCamera = useCallback(() => {
@@ -234,8 +293,12 @@ export default function ARShell() {
   }, [cameraState, facing, startCamera]);
 
   useEffect(() => {
+    metaRef.current = meta;
+  }, [meta]);
+
+  useEffect(() => {
     return () => {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     };
   }, []);
@@ -251,11 +314,12 @@ export default function ARShell() {
         name: label,
         lat: location?.lat,
         lng: location?.lng,
+        isNotBuilding: meta[label]?.isNegative === true,
       });
       buildingByLabelRef.current[label] = created;
       return created.id;
     },
-    [],
+    [meta],
   );
 
   useEffect(() => {
@@ -272,6 +336,24 @@ export default function ARShell() {
           nextMap[building.name] = building;
         }
         buildingByLabelRef.current = nextMap;
+        const nextMeta = { ...metaRef.current };
+        for (const building of buildings) {
+          const existing = nextMeta[building.name] ?? {};
+          const isNegative = existing.isNegative === true || building.isNotBuilding === true;
+          nextMeta[building.name] = { ...existing, isNegative };
+          if (existing.isNegative === true && building.isNotBuilding !== true) {
+            void updateBuildingRemote(token, building.id, { isNotBuilding: true })
+              .then((updated) => {
+                buildingByLabelRef.current[building.name] = { ...building, ...updated };
+              })
+              .catch((error) => {
+                console.warn("AR: failed to backfill not-building flag", error);
+              });
+          }
+        }
+        metaRef.current = nextMeta;
+        saveMeta(nextMeta);
+        setMeta(nextMeta);
         setBackendReady(true);
       } catch (error) {
         console.warn("AR: backend auth/sync failed", error);
@@ -298,6 +380,18 @@ export default function ARShell() {
         setHydrationStatus("loading");
         const groups = await listAllSamplesByBuilding(token);
         if (cancelled) return;
+        const nextMeta = { ...metaRef.current };
+        for (const group of groups) {
+          const name = group.building.name;
+          const existing = nextMeta[name] ?? {};
+          nextMeta[name] = {
+            ...existing,
+            isNegative: existing.isNegative === true || group.building.isNotBuilding === true,
+          };
+        }
+        metaRef.current = nextMeta;
+        saveMeta(nextMeta);
+        setMeta(nextMeta);
         for (const group of groups) {
           for (const sample of group.samples) {
             if (sample.embedding.length === 0) continue;
@@ -330,10 +424,12 @@ export default function ARShell() {
         engineRef.current = eng;
         loadDataset(eng);
         setCounts(eng.counts());
-        setMeta(loadMeta());
+        const loadedMeta = loadMeta();
+        metaRef.current = loadedMeta;
+        setMeta(loadedMeta);
         setEngineStatus("ready");
       } catch (e) {
-        setEngineError(e instanceof Error ? e.message : "Engine load failed");
+        setEngineError(e instanceof Error ? e.message : t("engineLoadFailed"));
         setEngineStatus("error");
       }
     })();
@@ -345,7 +441,7 @@ export default function ARShell() {
         eng.dispose();
       }
     };
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     if (!ENABLE_GPS_FEATURES) return;
@@ -431,6 +527,7 @@ export default function ARShell() {
     }> = [];
     for (const [label, m] of Object.entries(meta)) {
       if (!m.location) continue;
+      if (isNegativeClassLabel(label, meta)) continue;
       const count = counts[label] ?? 0;
       if (count === 0) continue;
       const distance = haversineMeters(userLocation, m.location);
@@ -464,6 +561,7 @@ export default function ARShell() {
     if (!userLocation) return undefined;
     const inRange = Object.entries(meta).filter(([label, m]) => {
       if (!m.location) return false;
+      if (isNegativeClassLabel(label, meta)) return false;
       if ((counts[label] ?? 0) === 0) return false;
       return haversineMeters(userLocation, m.location) <= MAX_RANGE_M;
     });
@@ -471,21 +569,241 @@ export default function ARShell() {
     return new Set(inRange.map(([label]) => label));
   }, [counts, meta, userLocation]);
 
-  const toggleLabelNegative = useCallback((label: string, value: boolean) => {
-    setMeta((prev) => {
-      const existing = prev[label] ?? {};
-      const next: AllMeta = {
-        ...prev,
-        [label]: { ...existing, isNegative: value },
-      };
-      saveMeta(next);
-      return next;
+  /**
+   * Labels the classifier may compare against. Negative ("not building") labels
+   * stay in the set as rejectors: if they are most similar, UI asks for a building.
+   */
+  const recognitionAllowedLabels = useMemo((): Set<string> | undefined => {
+    const negativeRejectors = new Set<string>();
+    const buildingCandidates = new Set<string>();
+    let anySamples = false;
+    for (const [label, n] of Object.entries(counts)) {
+      if (n <= 0) continue;
+      anySamples = true;
+      if (isNegativeClassLabel(label, meta)) {
+        negativeRejectors.add(label);
+      } else {
+        buildingCandidates.add(label);
+      }
+    }
+    if (!anySamples) return undefined;
+
+    const labels = new Set<string>(negativeRejectors);
+    if (allowedLabels === undefined) {
+      for (const label of buildingCandidates) labels.add(label);
+      return labels;
+    }
+
+    for (const label of buildingCandidates) {
+      if (allowedLabels.has(label)) labels.add(label);
+    }
+    return labels;
+  }, [counts, meta, allowedLabels]);
+
+  const toggleLabelNegative = useCallback(
+    (label: string, value: boolean) => {
+      setMeta((prev) => {
+        const existing = prev[label] ?? {};
+        const next: AllMeta = {
+          ...prev,
+          [label]: { ...existing, isNegative: value },
+        };
+        metaRef.current = next;
+        saveMeta(next);
+        return next;
+      });
+      const token = tokenRef.current;
+      const remote = buildingByLabelRef.current[label];
+      if (!backendReady || !token) return;
+
+      if (remote?.id) {
+        void updateBuildingRemote(token, remote.id, { isNotBuilding: value })
+          .then((updated) => {
+            buildingByLabelRef.current[label] = { ...remote, ...updated };
+          })
+          .catch((err) => {
+            console.warn("AR: failed to persist not-building flag", err);
+          });
+        return;
+      }
+
+      if (value) {
+        void createBuildingRemote(token, { name: label, isNotBuilding: true })
+          .then((created) => {
+            buildingByLabelRef.current[label] = created;
+          })
+          .catch((err) => {
+            console.warn("AR: failed to create not-building remote label", err);
+          });
+      }
+    },
+    [backendReady],
+  );
+
+  useEffect(() => {
+    allowedLabelsRef.current = recognitionAllowedLabels;
+  }, [recognitionAllowedLabels]);
+
+  const toggleDemoLock = useCallback(() => {
+    setDemoLockEnabled((prev) => {
+      if (prev) {
+        lockHoldLabelRef.current = null;
+        lockGraceMissRef.current = 0;
+        requestAnimationFrame(() => {
+          setLockActive(false);
+        });
+      }
+      return !prev;
     });
   }, []);
 
+  const syncArExperience = useCallback(
+    (rawLabel: string | null | undefined, mode: "positive" | "clear") => {
+      if (mode === "clear" || !rawLabel || isNonBuildingSceneLabel(rawLabel, meta)) {
+        experienceStreakRef.current = { label: "", passes: 0 };
+        setExperienceBuildingLabel(null);
+        return;
+      }
+      if (experienceStreakRef.current.label === rawLabel) {
+        experienceStreakRef.current.passes += 1;
+      } else {
+        experienceStreakRef.current = { label: rawLabel, passes: 1 };
+      }
+      if (experienceStreakRef.current.passes < MATCH_REPEAT_TO_SHOW_INFO) return;
+      setExperienceBuildingLabel(rawLabel);
+      if (!backendReady) return;
+      const token = tokenRef.current;
+      const building = buildingByLabelRef.current[rawLabel];
+      if (!token || !building) return;
+      const dedupeKey = `${rawLabel}:${experienceStreakRef.current.passes}`;
+      if (lastRecordedIssueForLabelRef.current === dedupeKey) return;
+      lastRecordedIssueForLabelRef.current = dedupeKey;
+      void (async () => {
+        try {
+          const foundIssue = await getIssueByLabelRemote(token, rawLabel);
+          const issue =
+            foundIssue ??
+            (await createIssueRemote(token, {
+              title: rawLabel,
+              buildingId: building.id,
+              description: t("issueCreatedFromMatch"),
+              lat: building.lat ?? undefined,
+              lng: building.lng ?? undefined,
+            }));
+          await recordMatchEventRemote(token, issue.id, { buildingId: building.id });
+          const updatedIssue = await getIssueByLabelRemote(token, rawLabel);
+          setActiveIssue(updatedIssue);
+          if (updatedIssue) {
+            const comments = await listIssueCommentsRemote(token, updatedIssue.id).catch(() => []);
+            setIssueComments(comments);
+          } else {
+            setIssueComments([]);
+          }
+        } catch (error) {
+          console.warn("AR: issue sync failed; keeping local match UI", error);
+        }
+      })();
+    },
+    [backendReady, meta, t],
+  );
+
+  const clearRecognitionExperience = useCallback(() => {
+    setExperienceBuildingLabel(null);
+    experienceStreakRef.current = { label: "", passes: 0 };
+    lastRecordedIssueForLabelRef.current = "";
+    setActiveIssue(null);
+    setIssueComments([]);
+    predictionUiKeyRef.current = "none";
+    setPrediction(null);
+    missStreakRef.current = 0;
+    consensusRef.current = [];
+    lockHoldLabelRef.current = null;
+    lockGraceMissRef.current = 0;
+    setLockActive(false);
+  }, []);
+
+  const hydrateIssueForLabel = useCallback(
+    async (label: string) => {
+      const token = tokenRef.current;
+      if (!token || !backendReady) return;
+      const issue = await getIssueByLabelRemote(token, label);
+      setActiveIssue(issue);
+      if (issue) {
+        const comments = await listIssueCommentsRemote(token, issue.id).catch(() => []);
+        setIssueComments(comments);
+      } else {
+        setIssueComments([]);
+      }
+    },
+    [backendReady],
+  );
+
   useEffect(() => {
-    allowedLabelsRef.current = allowedLabels;
-  }, [allowedLabels]);
+    if (!experienceBuildingLabel) {
+      setActiveIssue(null);
+      setIssueComments([]);
+      return;
+    }
+    void hydrateIssueForLabel(experienceBuildingLabel);
+  }, [experienceBuildingLabel, hydrateIssueForLabel]);
+
+  const handleJoinDiscussion = useCallback((label: string) => {
+    setExperienceBuildingLabel(label);
+  }, []);
+
+  const handleReportIssue = useCallback(async () => {
+    const token = tokenRef.current;
+    if (!token || !backendReady) return;
+    const topLabel = prediction?.label?.trim();
+    const title = topLabel && topLabel.length > 0 ? topLabel : "Unrecognized scene";
+    const ok = window.confirm(t("confirmCreateIssue"));
+    if (!ok) return;
+    setIssueBusy(true);
+    try {
+      const issue = await createIssueRemote(token, {
+        title,
+        description: t("issueCreatedFromAr"),
+        lat: userLocation?.lat,
+        lng: userLocation?.lng,
+      });
+      setActiveIssue(issue);
+      setIssueComments([]);
+      setExperienceBuildingLabel(title);
+    } finally {
+      setIssueBusy(false);
+    }
+  }, [backendReady, prediction?.label, t, userLocation?.lat, userLocation?.lng]);
+
+  const handleSupportIssue = useCallback(async () => {
+    const token = tokenRef.current;
+    if (!token || !activeIssue || issueBusy) return;
+    setIssueBusy(true);
+    try {
+      const updated = await supportIssueRemote(token, activeIssue.id);
+      if (updated) setActiveIssue(updated);
+    } finally {
+      setIssueBusy(false);
+    }
+  }, [activeIssue, issueBusy]);
+
+  const handleAddIssueComment = useCallback(async () => {
+    const token = tokenRef.current;
+    if (!token || !activeIssue || issueBusy) return;
+    const text = window.prompt(t("issueCommentPrompt"));
+    if (!text || text.trim().length === 0) return;
+    setIssueBusy(true);
+    try {
+      const created = await createIssueCommentRemote(token, activeIssue.id, text.trim());
+      setIssueComments((prev) => [...prev, created]);
+      const refreshed = await getIssueByLabelRemote(
+        token,
+        activeIssue.buildingLabel ?? experienceBuildingLabel ?? activeIssue.title,
+      ).catch(() => null);
+      if (refreshed) setActiveIssue(refreshed);
+    } finally {
+      setIssueBusy(false);
+    }
+  }, [activeIssue, experienceBuildingLabel, issueBusy, t]);
 
   useEffect(() => {
     if (mode !== "recognize") return;
@@ -493,9 +811,19 @@ export default function ARShell() {
 
     let stopped = false;
     let timer: number | undefined;
+    const commitPrediction = (next: UiPrediction | null) => {
+      const key = predictionRenderKey(next);
+      if (key === predictionUiKeyRef.current) return;
+      predictionUiKeyRef.current = key;
+      setPrediction(next);
+    };
 
     const tick = async () => {
       if (stopped) return;
+      if (document.visibilityState !== "visible") {
+        timer = window.setTimeout(tick, 600);
+        return;
+      }
       const eng = engineRef.current;
       const video = videoRef.current;
       if (!eng || !video || video.readyState < 2) {
@@ -504,24 +832,57 @@ export default function ARShell() {
       }
       try {
         const startedAt = performance.now();
+        const profile = RECOGNITION_PROFILES[recognitionProfile];
+        const gate: RecognitionGate = {
+          minConfidence: profile.minConfidence,
+          minMargin: profile.minMargin,
+        };
         const r = await eng.classify(video, allowedLabelsRef.current, {
-          minConfidence: RECOGNITION_PROFILES[recognitionProfile].minConfidence,
+          minConfidence: profile.minConfidence,
           returnBestEffort: true,
         });
-        const now = performance.now();
-        setLastInferenceMs(Math.round(now - startedAt));
+        const nextInferenceMs = Math.round(performance.now() - startedAt);
+        const shouldCommitInferenceMs =
+          startedAt - inferenceUiLastCommitAtRef.current >= 500 ||
+          Math.abs(nextInferenceMs - inferenceUiLastValueRef.current) >= 10;
+        if (shouldCommitInferenceMs) {
+          inferenceUiLastCommitAtRef.current = startedAt;
+          inferenceUiLastValueRef.current = nextInferenceMs;
+          setLastInferenceMs(nextInferenceMs);
+        }
         if (!stopped) {
-          if (demoLockEnabled && now < lockUntilRef.current) {
-            setLockActive(true);
-            timer = window.setTimeout(tick, RECOGNIZE_INTERVAL_MS);
-            return;
-          }
-          setLockActive(false);
-
-          const voteLabel = r && !r.isLowConfidence ? r.label : null;
+          const voteLabel = r && passesRecognitionGate(r, gate) ? r.label : null;
           consensusRef.current.push({ label: voteLabel, confidence: r?.confidence ?? 0 });
-          if (consensusRef.current.length > CONSENSUS_WINDOW) {
+          if (consensusRef.current.length > profile.consensusWindow) {
             consensusRef.current.shift();
+          }
+
+          const held = demoLockEnabled ? lockHoldLabelRef.current : null;
+          if (held !== null) {
+            const aligns =
+              r !== null && r.label === held && passesRecognitionGate(r, gate);
+            if (aligns) {
+              lockGraceMissRef.current = 0;
+              setLockActive(true);
+              const heldPred = enrichUiPrediction(r, meta, t("percentNoBuilding"), gate);
+              commitPrediction(heldPred);
+              if (heldPred?.isNotInDb || heldPred?.isNoBuilding) {
+                syncArExperience(null, "clear");
+              } else if (heldPred?.label) {
+                syncArExperience(held, "positive");
+              }
+              timer = window.setTimeout(tick, RECOGNIZE_INTERVAL_MS);
+              return;
+            }
+            lockGraceMissRef.current += 1;
+            if (lockGraceMissRef.current < LOCK_GRACE_FRAMES) {
+              setLockActive(true);
+              timer = window.setTimeout(tick, RECOGNIZE_INTERVAL_MS);
+              return;
+            }
+            lockHoldLabelRef.current = null;
+            lockGraceMissRef.current = 0;
+            setLockActive(false);
           }
 
           const votes = new Map<string, number>();
@@ -538,24 +899,51 @@ export default function ARShell() {
             }
           }
 
-          if (topLabel && topVotes >= CONSENSUS_MIN_VOTES) {
-            const topItems = consensusRef.current.filter((item) => item.label === topLabel);
-            const avgConfidence =
-              topItems.reduce((sum, item) => sum + item.confidence, 0) / topItems.length;
-            const consensusPrediction = toDisplayPrediction(
-              {
-                label: topLabel,
-                confidence: avgConfidence,
-                confidences: r?.confidences ?? { [topLabel]: avgConfidence },
-                isLowConfidence: false,
-              },
-              meta,
+          if (topLabel && topVotes >= profile.consensusMinVotes) {
+            const topItems = consensusRef.current.filter(
+              (item) => item.label === topLabel && item.confidence >= gate.minConfidence,
             );
-            setPrediction(consensusPrediction);
+            const avgConfidence =
+              topItems.length > 0
+                ? topItems.reduce((sum, item) => sum + item.confidence, 0) / topItems.length
+                : 0;
+            const confidences = r?.confidences ?? { [topLabel]: avgConfidence };
+            const consensusMargin = effectiveMargin({ confidences });
+            const consensusRaw: Prediction = {
+              label: topLabel,
+              confidence: avgConfidence,
+              confidences,
+              margin: consensusMargin,
+              isLowConfidence:
+                avgConfidence < gate.minConfidence || consensusMargin < gate.minMargin,
+            };
+            const consensusPrediction = enrichUiPrediction(
+              consensusRaw,
+              meta,
+              t("percentNoBuilding"),
+              gate,
+            );
+            commitPrediction(consensusPrediction);
+            if (consensusPrediction?.isNotInDb || consensusPrediction?.isNoBuilding) {
+              syncArExperience(null, "clear");
+            } else if (consensusPrediction?.label) {
+              syncArExperience(consensusPrediction.label, "positive");
+            }
             missStreakRef.current = 0;
-            if (demoLockEnabled) {
-              lockUntilRef.current = now + DEMO_LOCK_MS;
+            if (
+              demoLockEnabled &&
+              consensusPrediction &&
+              !consensusPrediction.isNoBuilding &&
+              !consensusPrediction.isNotInDb &&
+              !isNonBuildingSceneLabel(topLabel, meta)
+            ) {
+              lockHoldLabelRef.current = topLabel;
+              lockGraceMissRef.current = 0;
               setLockActive(true);
+            } else {
+              lockHoldLabelRef.current = null;
+              lockGraceMissRef.current = 0;
+              setLockActive(false);
             }
             timer = window.setTimeout(tick, RECOGNIZE_INTERVAL_MS);
             return;
@@ -563,11 +951,36 @@ export default function ARShell() {
 
           if (r) {
             missStreakRef.current = 0;
-            setPrediction(toDisplayPrediction(r, meta));
+            const disp = enrichUiPrediction(r, meta, t("percentNoBuilding"), gate);
+            commitPrediction(disp);
+            if (disp?.isNotInDb || disp?.isNoBuilding) {
+              syncArExperience(null, "clear");
+            } else if (disp?.label) {
+              syncArExperience(disp.label, "positive");
+            }
+            if (
+              demoLockEnabled &&
+              disp &&
+              !disp.isNoBuilding &&
+              !disp.isNotInDb &&
+              !isNonBuildingSceneLabel(r.label, meta)
+            ) {
+              lockHoldLabelRef.current = r.label;
+              lockGraceMissRef.current = 0;
+              setLockActive(true);
+            } else {
+              lockHoldLabelRef.current = null;
+              lockGraceMissRef.current = 0;
+              setLockActive(false);
+            }
           } else {
             missStreakRef.current += 1;
             if (missStreakRef.current >= 3) {
-              setPrediction(null);
+              commitPrediction(null);
+              syncArExperience(null, "clear");
+              lockHoldLabelRef.current = null;
+              lockGraceMissRef.current = 0;
+              setLockActive(false);
             }
           }
         }
@@ -582,7 +995,16 @@ export default function ARShell() {
       stopped = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [mode, engineStatus, cameraReady, recognitionProfile, demoLockEnabled, meta]);
+  }, [
+    mode,
+    engineStatus,
+    cameraReady,
+    recognitionProfile,
+    demoLockEnabled,
+    meta,
+    t,
+    syncArExperience,
+  ]);
 
   const startCapture = useCallback(async () => {
     const eng = engineRef.current;
@@ -750,10 +1172,17 @@ export default function ARShell() {
 
   const changeMode = (next: Mode) => {
     if (next !== "recognize") {
+      setExperienceBuildingLabel(null);
+      experienceStreakRef.current = { label: "", passes: 0 };
+      lastRecordedIssueForLabelRef.current = "";
+      setActiveIssue(null);
+      setIssueComments([]);
+      predictionUiKeyRef.current = "none";
       setPrediction(null);
       missStreakRef.current = 0;
       consensusRef.current = [];
-      lockUntilRef.current = 0;
+      lockHoldLabelRef.current = null;
+      lockGraceMissRef.current = 0;
       setLockActive(false);
     }
     setMode(next);
@@ -762,11 +1191,14 @@ export default function ARShell() {
   const clearAll = () => {
     const eng = engineRef.current;
     if (!eng) return;
-    if (!window.confirm("Clear all taught buildings?")) return;
+    if (!window.confirm(t("confirmClearAll"))) return;
     eng.clearAll();
     clearStoredDataset();
     setCounts(eng.counts());
     setMeta({});
+    setActiveIssue(null);
+    setIssueComments([]);
+    lastRecordedIssueForLabelRef.current = "";
     if (backendReady && tokenRef.current) {
       const remoteBuildings = Object.values(buildingByLabelRef.current);
       for (const building of remoteBuildings) {
@@ -781,196 +1213,241 @@ export default function ARShell() {
 
   const selectedCount = selectedBuilding ? (counts[selectedBuilding] ?? 0) : 0;
   const hasFloatingLabels = mode === "recognize" && nearby.length > 0;
+  const teachScanFrameActive =
+    mode === "teach" &&
+    cameraReady &&
+    !!selectedBuilding &&
+    meta[selectedBuilding]?.isNegative !== true;
   const showCompassPrompt =
     mode === "recognize" &&
     cameraReady &&
     ENABLE_GPS_FEATURES &&
     orientationStatus === "needsPermission" &&
     Object.keys(meta).length > 0;
+  const showRoadIssueMatchedBadge =
+    mode === "recognize" &&
+    cameraReady &&
+    !!prediction &&
+    !prediction.isNoBuilding &&
+    prediction.confidence >= CAMERA_MATCH_BADGE_MIN_CONFIDENCE &&
+    experienceStreakRef.current.label === prediction.label &&
+    experienceStreakRef.current.passes >= MATCH_REPEAT_TO_SHOW_INFO &&
+    isRoadIssueLabel(prediction.label);
+  const showMatchedStatsStrip =
+    mode === "recognize" &&
+    cameraReady &&
+    !!prediction &&
+    !prediction.isNoBuilding &&
+    prediction.confidence >= CAMERA_MATCH_BADGE_MIN_CONFIDENCE &&
+    experienceStreakRef.current.label === prediction.label &&
+    experienceStreakRef.current.passes >= MATCH_REPEAT_TO_SHOW_INFO;
 
   return (
-    <main className="relative mx-auto flex h-svh w-full max-w-md flex-col overflow-hidden bg-neutral-950 text-white md:my-4 md:h-[calc(100svh-2rem)] md:rounded-3xl md:shadow-2xl md:ring-1 md:ring-white/10">
-      <video
-        ref={videoRef}
-        autoPlay
-        muted
-        playsInline
-        className="absolute inset-0 h-full w-full object-cover"
-      />
-      <div className="pointer-events-none absolute inset-0 bg-black/30" />
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,rgba(0,0,0,0.45)_0%,transparent_22%,transparent_55%,rgba(0,0,0,0.85)_100%)]" />
-      {mode === "recognize" && cameraReady && prediction?.label !== "No building" && (
-        <div className="pointer-events-none absolute inset-0 z-11 flex items-center justify-center">
-          <div className="relative h-[40vh] w-[74vw] max-w-[330px] rounded-2xl border border-cyan-200/40">
-            <div className="absolute left-0 top-0 h-8 w-8 border-l-2 border-t-2 border-cyan-300" />
-            <div className="absolute right-0 top-0 h-8 w-8 border-r-2 border-t-2 border-cyan-300" />
-            <div className="absolute bottom-0 left-0 h-8 w-8 border-b-2 border-l-2 border-cyan-300" />
-            <div className="absolute bottom-0 right-0 h-8 w-8 border-b-2 border-r-2 border-cyan-300" />
-            <div className="absolute left-2 right-2 top-1/2 h-px -translate-y-1/2 animate-pulse bg-cyan-300/75" />
+    <main className="relative mx-auto flex h-svh w-full max-w-md flex-col overflow-hidden bg-white text-zinc-900 md:my-4 md:h-[calc(100svh-2rem)] md:rounded-2xl md:shadow-xl md:ring-1 md:ring-zinc-200">
+      <section
+        className={cn(
+          "relative w-full shrink-0 overflow-hidden bg-zinc-900 transition-[height] duration-300 ease-in-out",
+          mode === "teach" ? "h-[50svh]" : "h-[80svh] rounded-b-3xl",
+        )}
+      >
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-[1] h-20 bg-gradient-to-b from-white/85 via-white/25 to-transparent" />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[1] h-16 bg-gradient-to-t from-black/35 to-transparent" />
+        {showMatchedStatsStrip && <HighlightStatsStrip />}
+
+        <div className="relative z-10 flex items-start justify-between gap-2 px-3 pt-[max(env(safe-area-inset-top),10px)]">
+          <div>
+            <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-zinc-600">
+              {t("brandSubtitle")}
+            </p>
+            <h1 className="text-sm font-bold text-zinc-900">
+              {mode === "teach" ? t("modeTeach") : t("modeRecognize")}
+            </h1>
           </div>
+          <StatusPill engineStatus={engineStatus} cameraState={cameraState} />
         </div>
-      )}
+        {showRoadIssueMatchedBadge && (
+          <div className="pointer-events-none relative z-10 mt-1 flex justify-center px-3">
+            <span className="inline-flex items-center rounded-full border border-emerald-300 bg-emerald-50/95 px-3 py-1 text-[11px] font-bold uppercase tracking-wide text-emerald-800 shadow-sm">
+              {t("matchedLabel")} · {t("roadIssueMatchedName")}
+            </span>
+          </div>
+        )}
 
-      <div className="relative z-20 flex items-start justify-between gap-2 px-4 pt-[max(env(safe-area-inset-top),12px)]">
-        <div>
-          <p className="text-[10px] font-medium uppercase tracking-[0.22em] text-cyan-200">
-            Building AR
-          </p>
-          <h1 className="text-base font-semibold">
-            {mode === "teach" ? "Teach mode" : "Recognize mode"}
-          </h1>
-        </div>
-        <StatusPill engineStatus={engineStatus} cameraState={cameraState} />
-      </div>
-
-      {engineError && (
-        <div className="relative z-30 mx-4 mt-3 rounded-lg border border-red-500/40 bg-black/85 p-3 text-sm">
-          <div className="flex items-start gap-2">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
-            <div>
-              <p className="font-semibold">Recognition engine failed</p>
-              <p className="mt-1 text-xs text-neutral-300">{engineError}</p>
+        {engineError && (
+          <div className="relative z-20 mx-3 mt-2 rounded-lg border border-red-200 bg-white/95 p-2 text-xs text-red-800 shadow-sm">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
+              <div>
+                <p className="font-semibold">{t("engineFailedTitle")}</p>
+                <p className="mt-0.5 text-[11px] text-red-700/85">{engineError}</p>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {(cameraState === "idle" ||
-        cameraState === "starting" ||
-        cameraState === "error") && (
-        <CameraGate state={cameraState} error={cameraError} onStart={startCamera} />
-      )}
-
-      {cameraState === "ready" && engineStatus === "loading" && (
-        <div className="pointer-events-none absolute left-1/2 top-1/2 z-20 -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-white/15 bg-black/65 px-4 py-3 text-center backdrop-blur">
-          <div className="mx-auto h-6 w-6 animate-spin rounded-full border-2 border-white/20 border-t-cyan-300" />
-          <p className="mt-2 text-sm font-medium">Loading recognition model</p>
-          <p className="mt-0.5 text-[11px] text-neutral-400">~3 MB, one-time download</p>
-        </div>
-      )}
-
-      {hasFloatingLabels && (
-        <div className="pointer-events-none absolute inset-0 z-10">
-          {nearby.map((b) => {
-            const isMatch = prediction?.label === b.label;
-            return (
-              <div
-                key={b.label}
-                className="absolute flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-all duration-200"
-                style={{ left: `${b.screenX}%`, top: `${b.screenY}%` }}
-              >
-                <div
-                  className={`h-3 w-3 rounded-full ${
-                    isMatch
-                      ? "bg-cyan-300 ring-4 ring-cyan-300/30 animate-pulse"
-                      : "bg-white/70 ring-2 ring-white/20"
-                  }`}
-                />
-                <div className="mt-1 h-3 w-px bg-white/30" />
-                <div
-                  className={`mt-0.5 rounded-md border px-2 py-1 text-center backdrop-blur ${
-                    isMatch
-                      ? "border-cyan-300/60 bg-cyan-300/15"
-                      : "border-white/15 bg-black/55"
-                  }`}
-                >
-                  <p
-                    className={`text-xs font-semibold leading-tight ${
-                      isMatch ? "text-cyan-100" : "text-white"
-                    }`}
-                  >
-                    {b.label}
-                  </p>
-                  <p className="text-[10px] leading-tight text-neutral-300">
-                    {b.distance}m
-                    {isMatch && prediction
-                      ? ` · ${Math.round(prediction.confidence * 100)}%`
-                      : ""}
-                  </p>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {mode === "recognize" && !hasFloatingLabels && prediction?.label === "No building" && (
-        <div className="pointer-events-none absolute left-1/2 top-1/2 z-20 max-w-[min(90vw,280px)] -translate-x-1/2 -translate-y-1/2 px-4 text-center">
-          <p className="text-lg font-semibold text-white drop-shadow-md">Show the building</p>
-          <p className="mt-2 text-sm leading-snug text-neutral-200 drop-shadow-md">
-            Place the building in the frame.
-          </p>
-        </div>
-      )}
-
-      {mode === "recognize" && !hasFloatingLabels && prediction && prediction.label !== "No building" && (
-        <div className="pointer-events-none absolute left-1/2 top-1/2 z-20 -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-cyan-300/50 bg-black/55 px-4 py-3 text-center backdrop-blur">
-          <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">
-            {prediction.isLowConfidence ? "Candidate" : "Detected"}
-          </p>
-          <p className="mt-1 text-2xl font-semibold">{prediction.label}</p>
-          <div className="mx-auto mt-2 h-1.5 w-40 rounded-full bg-white/15">
-            <div
-              className="h-full rounded-full bg-cyan-300 transition-[width] duration-200"
-              style={{ width: `${Math.round(prediction.confidence * 100)}%` }}
-            />
+        {((mode === "recognize" && cameraReady && !prediction?.isNoBuilding) || teachScanFrameActive) && (
+          <div className="pointer-events-none absolute inset-0 z-[5] flex items-center justify-center">
+            {/* ROI must match `SCAN_ROI_*` in `@/lib/ar/video-scan-roi` (embeddings use that crop). */}
+            <div className="relative h-[42%] max-h-[260px] w-[72%] max-w-[300px] rounded-2xl border border-[#ffc300]/60">
+              <div className="absolute left-0 top-0 h-6 w-6 border-l-2 border-t-2 border-[#fca311]" />
+              <div className="absolute right-0 top-0 h-6 w-6 border-r-2 border-t-2 border-[#fca311]" />
+              <div className="absolute bottom-0 left-0 h-6 w-6 border-b-2 border-l-2 border-[#fca311]" />
+              <div className="absolute bottom-0 right-0 h-6 w-6 border-b-2 border-r-2 border-[#fca311]" />
+              <div className="absolute left-2 right-2 top-1/2 h-px -translate-y-1/2 animate-pulse bg-[#ffc300]/90" />
+            </div>
           </div>
-          <p className="mt-1 text-xs text-neutral-300">
-            {`${Math.round(prediction.confidence * 100)}%${prediction.isLowConfidence ? " low confidence" : " match"}`}
-          </p>
-        </div>
-      )}
+        )}
 
-      <div className="relative z-20 mt-auto px-3 pb-[max(env(safe-area-inset-bottom),12px)]">
+        {cameraState === "ready" && engineStatus === "loading" && (
+          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black/25">
+            <div className="rounded-xl border border-ar-navy/20 bg-white/95 px-4 py-3 text-center shadow-lg ring-1 ring-zinc-100 backdrop-blur-sm">
+              <div className="mx-auto h-6 w-6 animate-spin rounded-full border-2 border-zinc-200 border-t-ar-navy" />
+              <p className="mt-2 text-xs font-medium text-zinc-900">{t("loadingModel")}</p>
+              <p className="mt-0.5 text-[10px] text-zinc-500">{t("loadingModelHint")}</p>
+            </div>
+          </div>
+        )}
+
+        {(cameraState === "idle" ||
+          cameraState === "starting" ||
+          cameraState === "error") && (
+          <CameraGate state={cameraState} error={cameraError} onStart={startCamera} />
+        )}
+
+        {hasFloatingLabels && (
+          <div className="pointer-events-none absolute inset-0 z-[6]">
+            {nearby.map((b) => {
+              const isMatch = prediction?.label === b.label;
+              return (
+                <div
+                  key={b.label}
+                  className="absolute flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-all duration-200"
+                  style={{ left: `${b.screenX}%`, top: `${b.screenY}%` }}
+                >
+                  <div
+                    className={cn(
+                      "h-3 w-3 rounded-full shadow-md",
+                      isMatch
+                        ? "bg-[#fca311] ring-4 ring-[#ffc300]/50 animate-pulse"
+                        : "bg-white ring-2 ring-white",
+                    )}
+                  />
+                  <div className="mt-1 h-3 w-px bg-white/50" />
+                  <div
+                    className={cn(
+                      "mt-0.5 rounded-md border px-2 py-1 text-center shadow-md backdrop-blur-sm",
+                      isMatch
+                        ? "border-[#fca311]/55 bg-white/92 ring-1 ring-ar-navy/15"
+                        : "border-white/40 bg-black/55",
+                    )}
+                  >
+                    <p
+                      className={cn(
+                        "text-xs font-semibold leading-tight",
+                        isMatch ? "text-zinc-900" : "text-white",
+                      )}
+                    >
+                      {b.label}
+                    </p>
+                    <p
+                      className={cn(
+                        "text-[10px] leading-tight",
+                        isMatch ? "text-zinc-600" : "text-white/80",
+                      )}
+                    >
+                      {b.distance}m
+                      {isMatch && prediction
+                        ? ` · ${Math.round(prediction.confidence * 100)}%`
+                        : ""}
+                    </p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {cameraReady && (
-          <div className="mb-2 flex items-center justify-end gap-2">
+          <div className="absolute bottom-3 right-3 z-20 flex flex-col items-end gap-2">
+            <LanguageSwitcher />
             {showCompassPrompt && (
               <button
                 type="button"
                 onClick={enableCompass}
-                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-300/50 bg-black/55 px-3 text-xs font-medium text-cyan-200 backdrop-blur active:scale-95"
+                className="inline-flex h-8 items-center gap-1 rounded-full border border-zinc-200 bg-white/95 px-2.5 text-[10px] font-medium text-zinc-800 shadow-md active:scale-95"
               >
-                <Compass className="h-4 w-4" />
-                Enable compass
+                <Compass className="h-3.5 w-3.5 text-ar-navy" />
+                {t("compass")}
               </button>
             )}
             <button
               type="button"
               onClick={switchCamera}
-              className="flex h-11 w-11 items-center justify-center rounded-full border border-white/15 bg-black/55 backdrop-blur transition active:scale-95"
-              aria-label={`Switch to ${facing === "environment" ? "front" : "back"} camera`}
-              title={`Switch to ${facing === "environment" ? "front" : "back"} camera`}
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200 bg-white/95 text-zinc-800 shadow-md transition active:scale-95"
+              aria-label={
+                facing === "environment" ? t("switchCameraAriaFront") : t("switchCameraAriaBack")
+              }
+              title={
+                facing === "environment" ? t("switchCameraAriaFront") : t("switchCameraAriaBack")
+              }
             >
-              <SwitchCamera className="h-5 w-5 text-white" />
+              <SwitchCamera className="h-5 w-5 text-ar-navy" />
             </button>
           </div>
         )}
+      </section>
 
-        <div className="rounded-2xl border border-white/15 bg-neutral-950/82 p-3 shadow-2xl backdrop-blur">
+      <section
+        className={cn(
+          "flex min-h-0 flex-1 flex-col overflow-hidden transition-[min-height] duration-300 ease-in-out",
+          mode === "teach" ? "min-h-[50svh] border-t border-zinc-200 bg-white" : "min-h-0 bg-zinc-100",
+        )}
+      >
+        <div
+          className={cn(
+            "flex min-h-0 flex-1 flex-col pb-[max(env(safe-area-inset-bottom),10px)]",
+            mode === "recognize" ? "px-3 pt-3" : "px-2.5 pt-2",
+            mode === "teach" && "overflow-y-auto",
+            mode === "recognize" &&
+              "rounded-t-3xl border border-b-0 border-zinc-200/90 bg-white shadow-[0_-8px_30px_rgba(0,0,0,0.06)]",
+          )}
+        >
           <ModeToggle
             mode={mode}
             onChange={changeMode}
             profile={recognitionProfile}
             onProfileChange={setRecognitionProfile}
             demoLockEnabled={demoLockEnabled}
-            onToggleDemoLock={() => setDemoLockEnabled((prev) => !prev)}
+            onToggleDemoLock={toggleDemoLock}
           />
-          <SensorRow
-            locationStatus={locationStatus}
-            orientationStatus={orientationStatus}
-            userLocation={userLocation}
-            heading={heading}
-            onEnableCompass={enableCompass}
-          />
-          <DebugHud
-            classifyMs={lastInferenceMs}
-            hydrationStatus={hydrationStatus}
-            minConfidence={RECOGNITION_PROFILES[recognitionProfile].minConfidence}
-            sampleTotal={Object.values(counts).reduce((a, b) => a + b, 0)}
-            lockActive={lockActive}
-            demoLockEnabled={demoLockEnabled}
-          />
-          <div className="mt-2">
+          {ENABLE_GPS_FEATURES && (
+            <SensorRow
+              locationStatus={locationStatus}
+              orientationStatus={orientationStatus}
+              userLocation={userLocation}
+              heading={heading}
+              onEnableCompass={enableCompass}
+            />
+          )}
+          {mode !== "recognize" && (
+            <DebugHud
+              classifyMs={lastInferenceMs}
+              hydrationStatus={hydrationStatus}
+              minConfidence={RECOGNITION_PROFILES[recognitionProfile].minConfidence}
+              sampleTotal={Object.values(counts).reduce((a, b) => a + b, 0)}
+              lockActive={lockActive}
+              demoLockEnabled={demoLockEnabled}
+              compact={false}
+            />
+          )}
+          <div className={cn("min-h-0", mode === "teach" ? "mt-2 flex-1" : "mt-1 flex-none")}>
             {mode === "teach" ? (
               <TeachContent
                 counts={counts}
@@ -995,13 +1472,27 @@ export default function ARShell() {
                 counts={counts}
                 nearby={nearby}
                 hasGps={!!userLocation}
-                minConfidence={RECOGNITION_PROFILES[recognitionProfile].minConfidence}
+                matchMinSimilarity={RECOGNITION_PROFILES[recognitionProfile].minConfidence}
+                onConfirmMatch={handleJoinDiscussion}
+                onJoinDiscussion={handleJoinDiscussion}
+                onReportIssue={handleReportIssue}
                 onSwitchTeach={() => changeMode("teach")}
               />
             )}
           </div>
         </div>
-      </div>
+      </section>
+      {mode === "recognize" && experienceBuildingLabel !== null && (
+        <BuildingExperience
+          buildingName={experienceBuildingLabel}
+          issue={activeIssue}
+          issueComments={issueComments}
+          issueBusy={issueBusy}
+          onSupportIssue={handleSupportIssue}
+          onAddIssueComment={handleAddIssueComment}
+          onRefreshRecognition={clearRecognitionExperience}
+        />
+      )}
     </main>
   );
 }
@@ -1013,36 +1504,39 @@ function StatusPill({
   engineStatus: "loading" | "ready" | "error";
   cameraState: CameraState;
 }) {
+  const { t } = useI18n();
   const ok = engineStatus === "ready" && cameraState === "ready";
   const errored = engineStatus === "error" || cameraState === "error";
 
   const label =
     engineStatus === "error"
-      ? "Engine error"
+      ? t("statusEngineError")
       : cameraState === "error"
-        ? "Camera blocked"
+        ? t("statusCameraBlocked")
         : cameraState === "idle"
-          ? "Tap to enable"
+          ? t("statusTapToEnable")
           : engineStatus === "loading"
-            ? "Loading model"
+            ? t("loadingModel")
             : cameraState === "starting"
-              ? "Starting camera"
-              : "Ready";
+              ? t("statusStartingCamera")
+              : t("statusReady");
 
   return (
     <div
-      className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] backdrop-blur ${
+      className={cn(
+        "flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium shadow-sm ring-1 ring-zinc-200 backdrop-blur-sm",
         ok
-          ? "bg-emerald-500/20 text-emerald-200"
+          ? "bg-emerald-50 text-emerald-800"
           : errored
-            ? "bg-red-500/20 text-red-200"
-            : "bg-amber-500/20 text-amber-200"
-      }`}
+            ? "bg-red-50 text-red-800"
+            : "bg-[#ffc300]/20 text-zinc-800",
+      )}
     >
       <span
-        className={`h-1.5 w-1.5 rounded-full ${
-          ok ? "bg-emerald-300" : errored ? "bg-red-300" : "animate-pulse bg-amber-300"
-        }`}
+        className={cn(
+          "h-1.5 w-1.5 rounded-full",
+          ok ? "bg-emerald-500" : errored ? "bg-red-500" : "animate-pulse bg-[#fca311]",
+        )}
       />
       {label}
     </div>
@@ -1062,55 +1556,59 @@ function SensorRow({
   heading: number | null;
   onEnableCompass: () => void;
 }) {
+  const { t } = useI18n();
   const gpsLabel =
     locationStatus === "watching" && userLocation
-      ? `GPS · ±${Math.round(userLocation.accuracy)}m`
+      ? t("gpsAccuracy", { n: Math.round(userLocation.accuracy) })
       : locationStatus === "watching"
-        ? "GPS · waiting"
+        ? t("gpsWaiting")
         : locationStatus === "denied"
-          ? "GPS · denied"
+          ? t("gpsDenied")
           : locationStatus === "unavailable"
-            ? "GPS · n/a"
-            : "GPS · …";
+            ? t("gpsNa")
+            : t("gpsEllipsis");
 
   const compassLabel =
     orientationStatus === "watching" && heading != null
-      ? `${Math.round(heading)}°`
+      ? t("compassDegrees", { n: Math.round(heading) })
       : orientationStatus === "watching"
-        ? "compass · waiting"
+        ? t("compassWaiting")
         : orientationStatus === "needsPermission"
-          ? "Enable compass"
+          ? t("compassEnable")
           : orientationStatus === "denied"
-            ? "compass · denied"
-            : "compass · n/a";
+            ? t("compassDenied")
+            : t("compassNa");
 
   const gpsOk = locationStatus === "watching" && !!userLocation;
   const compassOk = orientationStatus === "watching" && heading != null;
   const compassNeeds = orientationStatus === "needsPermission";
 
   return (
-    <div className="mt-2 flex items-center gap-2 text-[10px]">
+    <div className="mt-1.5 flex items-center gap-1.5 text-[9px] text-zinc-600">
       <span
-        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 ${
-          gpsOk ? "bg-emerald-500/15 text-emerald-200" : "bg-white/8 text-neutral-300"
-        }`}
+        className={cn(
+          "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 ring-1 ring-zinc-200",
+          gpsOk ? "bg-emerald-50 text-emerald-800" : "bg-zinc-50 text-zinc-600",
+        )}
       >
-        <MapPin className="h-3 w-3" />
+        <MapPin className="h-2.5 w-2.5 text-ar-navy" />
         {gpsLabel}
       </span>
       <button
         type="button"
         onClick={compassNeeds ? onEnableCompass : undefined}
         disabled={!compassNeeds}
-        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 ${
+        className={cn(
+          "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 ring-1 ring-zinc-200",
           compassOk
-            ? "bg-emerald-500/15 text-emerald-200"
+            ? "bg-emerald-50 text-emerald-800"
             : compassNeeds
-              ? "bg-cyan-300/15 text-cyan-200"
-              : "bg-white/8 text-neutral-300"
-        } ${compassNeeds ? "cursor-pointer" : "cursor-default"}`}
+              ? "bg-[#ffc300]/25 text-zinc-900"
+              : "cursor-default bg-zinc-50 text-zinc-500",
+          compassNeeds && "cursor-pointer",
+        )}
       >
-        <Compass className="h-3 w-3" />
+        <Compass className="h-2.5 w-2.5 text-ar-navy" />
         {compassLabel}
       </button>
     </div>
@@ -1126,45 +1624,45 @@ function CameraGate({
   error: string | null;
   onStart: () => void;
 }) {
+  const { t } = useI18n();
   const isError = state === "error";
   const isStarting = state === "starting";
   return (
-    <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/85 px-6 backdrop-blur">
-      <div className="max-w-xs text-center">
+    <div className="absolute inset-0 z-30 flex items-center justify-center bg-white/80 px-6 backdrop-blur-md">
+      <div className="max-w-xs rounded-2xl border border-ar-navy/15 bg-white p-6 text-center shadow-xl ring-1 ring-zinc-100">
         <div
-          className={`mx-auto flex h-14 w-14 items-center justify-center rounded-2xl ${
-            isError ? "bg-red-500/15" : "bg-cyan-300/15"
-          }`}
+          className={cn(
+            "mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-zinc-100",
+            isError ? "bg-red-50" : "bg-[#ffc300]/20",
+          )}
         >
           {isError ? (
-            <AlertCircle className="h-7 w-7 text-red-300" />
+            <AlertCircle className="h-7 w-7 text-red-600" />
           ) : (
-            <Camera className="h-7 w-7 text-cyan-300" />
+            <Camera className="h-7 w-7 text-ar-navy" />
           )}
         </div>
-        <h2 className="mt-4 text-lg font-semibold">
-          {isError ? "Camera blocked" : "Enable camera"}
+        <h2 className="mt-4 text-lg font-bold text-zinc-900">
+          {isError ? t("cameraBlockedTitle") : t("enableCameraTitle")}
         </h2>
-        <p className="mt-2 text-sm leading-5 text-neutral-300">
-          {isError
-            ? error
-            : "We use the rear camera to recognize buildings. Frames stay on your device — nothing is uploaded."}
+        <p className="mt-2 text-sm leading-5 text-zinc-600">
+          {isError ? error : t("cameraPrivacyHint")}
         </p>
         <button
           type="button"
           onClick={onStart}
           disabled={isStarting}
-          className="mt-5 inline-flex h-11 items-center gap-2 rounded-xl bg-cyan-300 px-5 text-sm font-semibold text-neutral-950 disabled:opacity-60"
+          className="mt-5 inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-[#fca311] px-4 text-sm font-bold text-zinc-900 shadow-md disabled:opacity-60"
         >
           {isStarting ? (
             <>
-              <span className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-900/30 border-t-neutral-900" />
-              Starting...
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-800" />
+              {t("starting")}
             </>
           ) : (
             <>
-              <Camera className="h-4 w-4" />
-              {isError ? "Try again" : "Enable camera"}
+              <Camera className="h-4 w-4 text-ar-navy" />
+              {isError ? t("tryAgain") : t("enableCameraCta")}
             </>
           )}
         </button>
@@ -1188,58 +1686,67 @@ function ModeToggle({
   demoLockEnabled: boolean;
   onToggleDemoLock: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="space-y-2">
-      <div className="grid grid-cols-2 gap-1 rounded-xl bg-white/8 p-1">
+      <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-zinc-100 p-1 ring-1 ring-zinc-200/90">
         <button
           type="button"
           onClick={() => onChange("recognize")}
-          className={`flex h-9 items-center justify-center gap-1.5 rounded-lg text-sm font-medium transition ${
-            mode === "recognize" ? "bg-white text-neutral-950" : "text-neutral-200"
-          }`}
+          className={cn(
+            "flex h-9 items-center justify-center gap-1 rounded-lg text-[11px] font-semibold transition",
+            mode === "recognize"
+              ? "bg-white text-zinc-900 shadow-sm ring-1 ring-zinc-200"
+              : "text-zinc-500 hover:bg-white/70",
+          )}
         >
-          <ScanSearch className="h-4 w-4" />
-          Recognize
+          <ScanSearch className="h-3.5 w-3.5 shrink-0 text-ar-navy" />
+          {t("modeRecognize")}
         </button>
         <button
           type="button"
           onClick={() => onChange("teach")}
-          className={`flex h-9 items-center justify-center gap-1.5 rounded-lg text-sm font-medium transition ${
-            mode === "teach" ? "bg-white text-neutral-950" : "text-neutral-200"
-          }`}
+          className={cn(
+            "flex h-9 items-center justify-center gap-1 rounded-lg text-[11px] font-semibold transition",
+            mode === "teach"
+              ? "bg-[#fca311] text-zinc-900 shadow-sm"
+              : "text-zinc-500 hover:bg-white/70",
+          )}
         >
-          <Plus className="h-4 w-4" />
-          Teach
+          <Plus className="h-3.5 w-3.5 shrink-0 text-ar-navy" />
+          {t("modeTeach")}
         </button>
       </div>
       {mode === "recognize" && (
-        <div className="space-y-1">
-          <div className="flex items-center gap-1 rounded-lg bg-white/8 p-1 text-[11px]">
+        <div className="flex items-stretch gap-2">
+          <div className="flex min-w-0 flex-1 gap-0.5 rounded-xl border border-zinc-200 bg-zinc-100 p-0.5">
             {(Object.keys(RECOGNITION_PROFILES) as RecognitionProfile[]).map((key) => (
               <button
                 key={key}
                 type="button"
                 onClick={() => onProfileChange(key)}
-                className={`flex-1 rounded-md px-2 py-1 ${
+                className={cn(
+                  "min-h-9 min-w-0 flex-1 rounded-lg px-1 py-1.5 text-[10px] font-semibold transition",
                   profile === key
-                    ? "bg-cyan-300 text-neutral-950"
-                    : "text-neutral-300 hover:bg-white/10"
-                }`}
+                    ? "bg-[#ffc300] font-bold text-zinc-900 shadow-sm"
+                    : "text-zinc-500 hover:bg-white/80",
+                )}
               >
-                {RECOGNITION_PROFILES[key].label}
+                {t(RECOGNITION_PROFILES[key].labelKey)}
               </button>
             ))}
           </div>
           <button
             type="button"
             onClick={onToggleDemoLock}
-            className={`w-full rounded-lg px-2 py-1 text-[11px] ${
+            className={cn(
+              "inline-flex min-h-9 shrink-0 items-center justify-center rounded-xl border border-zinc-200 px-2.5 text-[10px] font-semibold transition",
               demoLockEnabled
-                ? "bg-cyan-300/25 text-cyan-100"
-                : "bg-white/8 text-neutral-300 hover:bg-white/10"
-            }`}
+                ? "bg-white text-zinc-900 shadow-sm"
+                : "bg-zinc-50 text-zinc-500",
+            )}
           >
-            Demo lock {demoLockEnabled ? "ON" : "OFF"}
+            {t("lockToggle")} {demoLockEnabled ? t("lockOn") : t("lockOff")}
           </button>
         </div>
       )}
@@ -1254,6 +1761,7 @@ function DebugHud({
   hydrationStatus,
   lockActive,
   demoLockEnabled,
+  compact,
 }: {
   sampleTotal: number;
   classifyMs: number;
@@ -1261,17 +1769,44 @@ function DebugHud({
   hydrationStatus: "idle" | "loading" | "done" | "error";
   lockActive: boolean;
   demoLockEnabled: boolean;
+  compact?: boolean;
 }) {
+  const { t } = useI18n();
+  const hydrationLabel =
+    hydrationStatus === "idle"
+      ? t("hydrateIdle")
+      : hydrationStatus === "loading"
+        ? t("hydrateLoading")
+        : hydrationStatus === "done"
+          ? t("hydrateDone")
+          : t("hydrateError");
+  const chip =
+    "rounded bg-zinc-50 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-zinc-600 ring-1 ring-zinc-200";
+  if (compact) {
+    return (
+      <p className="mt-1 truncate font-mono text-[8px] text-zinc-400">
+        n={sampleTotal} · {classifyMs}ms · {t("debugThr")}={Math.round(minConfidence * 100)}% ·{" "}
+        {hydrationLabel} · lk={demoLockEnabled ? (lockActive ? "*" : "+") : "—"}
+      </p>
+    );
+  }
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-1 text-[10px] text-neutral-300">
-      <span className="rounded-full bg-white/8 px-2 py-0.5">samples {sampleTotal}</span>
-      <span className="rounded-full bg-white/8 px-2 py-0.5">classify {classifyMs}ms</span>
-      <span className="rounded-full bg-white/8 px-2 py-0.5">
-        threshold {Math.round(minConfidence * 100)}%
+    <div className="mt-1.5 flex flex-wrap items-center gap-1">
+      <span className={chip}>
+        {t("debugSamples")} {sampleTotal}
       </span>
-      <span className="rounded-full bg-white/8 px-2 py-0.5">sync {hydrationStatus}</span>
-      <span className="rounded-full bg-white/8 px-2 py-0.5">
-        lock {demoLockEnabled ? (lockActive ? "active" : "armed") : "off"}
+      <span className={chip}>{classifyMs}ms</span>
+      <span className={chip}>
+        {t("debugThr")} {Math.round(minConfidence * 100)}%
+      </span>
+      <span className={chip}>{hydrationLabel}</span>
+      <span className={chip}>
+        {t("debugLock")}{" "}
+        {demoLockEnabled
+          ? lockActive
+            ? t("debugLockActive")
+            : t("debugLockArmed")
+          : t("debugLockOff")}
       </span>
     </div>
   );
@@ -1360,6 +1895,7 @@ function BuildingPicker({
   onClearAll: () => void;
   engineReady: boolean;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState("");
   const taught = Object.entries(counts);
   const trimmed = name.trim();
@@ -1372,25 +1908,35 @@ function BuildingPicker({
   };
 
   return (
-    <div className="space-y-3">
-      <p className="text-xs text-neutral-400">
-        Check <span className="text-amber-200">Not bldg</span> for any taught class that should
-        resolve to score 0 in Recognize (non-building / negative examples).
+    <div className="space-y-2">
+      <p className="text-[11px] leading-snug text-zinc-500">
+        {t("teachHintHighlight").trim() ? (
+          <>
+            {t("teachHintBefore")}{" "}
+            <span className="font-semibold text-[#fca311]">{t("teachHintHighlight")}</span>{" "}
+            {t("teachHintAfter")}
+          </>
+        ) : (
+          t("teachHintBefore")
+        )}
       </p>
 
       {taught.length > 0 && (
-        <div className="max-h-44 space-y-1.5 overflow-y-auto">
+        <div className="max-h-[38svh] space-y-1 overflow-y-auto scroll-smooth pb-1">
           {taught.map(([label, count]) => {
             const hasLoc = !!meta[label]?.location;
             const isNegative = meta[label]?.isNegative === true;
             return (
               <div
                 key={label}
-                className={`flex items-center gap-2 rounded-lg px-2 py-2 ${
-                  isNegative ? "bg-amber-300/10 ring-1 ring-amber-300/35" : "bg-white/8"
-                }`}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg px-2 py-1.5 ring-1",
+                  isNegative
+                    ? "bg-[#ffc300]/15 ring-[#fca311]/40"
+                    : "bg-white ring-zinc-200",
+                )}
               >
-                <label className="flex shrink-0 cursor-pointer flex-col items-center gap-0.5 py-1">
+                <label className="flex shrink-0 cursor-pointer flex-col items-center gap-0.5 py-0.5">
                   <input
                     type="checkbox"
                     checked={isNegative}
@@ -1398,11 +1944,11 @@ function BuildingPicker({
                       e.stopPropagation();
                       onToggleNegative(label, e.target.checked);
                     }}
-                    aria-label={`Mark ${label} as not-building negative`}
-                    className="h-4 w-4 rounded border-white/30 bg-neutral-950 text-amber-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300"
+                    aria-label={t("ariaMarkNegative", { name: label })}
+                    className="h-3.5 w-3.5 rounded border-ar-navy/30 text-[#fca311] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ar-navy"
                   />
-                  <span className="text-[8px] font-medium uppercase tracking-tight text-amber-200/90">
-                    Not bldg
+                  <span className="text-[7px] font-bold uppercase tracking-tight text-zinc-500">
+                    {t("negShort")}
                   </span>
                 </label>
                 <button
@@ -1410,25 +1956,25 @@ function BuildingPicker({
                   onClick={() => onSelect(label)}
                   className="min-w-0 flex-1 text-left"
                 >
-                  <p className="truncate text-sm font-medium">{label}</p>
-                  <p className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-400">
+                  <p className="truncate text-sm font-semibold text-zinc-900">{label}</p>
+                  <p className="flex flex-wrap items-center gap-1 text-[10px] text-zinc-500">
                     <span>
-                      {count} sample{count === 1 ? "" : "s"}
+                      {count} {count === 1 ? t("sampleOne") : t("sampleMany")}
                     </span>
                     {isNegative && (
-                      <span className="inline-flex rounded-full bg-amber-500/20 px-1 py-px text-amber-100">
-                        negative
+                      <span className="inline-flex rounded bg-[#fca311]/25 px-1 py-px text-[9px] font-semibold text-zinc-900">
+                        {t("tagNotBuilding")}
                       </span>
                     )}
                     {count < RECOMMENDED_SAMPLES_PER_BUILDING && (
-                      <span className="inline-flex items-center rounded-full bg-amber-500/15 px-1 py-px text-amber-200">
-                        low
+                      <span className="inline-flex rounded bg-amber-100 px-1 py-px text-[9px] text-amber-900">
+                        {t("tagLow")}
                       </span>
                     )}
                     {hasLoc && (
-                      <span className="inline-flex items-center gap-0.5 rounded-full bg-emerald-500/15 px-1 py-px text-emerald-200">
-                        <MapPin className="h-2.5 w-2.5" />
-                        GPS
+                      <span className="inline-flex items-center gap-0.5 rounded-full bg-emerald-100 px-1 py-px text-[9px] text-emerald-900">
+                        <MapPin className="h-2.5 w-2.5 text-ar-navy" />
+                        {t("tagGps")}
                       </span>
                     )}
                   </p>
@@ -1436,8 +1982,8 @@ function BuildingPicker({
                 <button
                   type="button"
                   onClick={() => onRemove(label)}
-                  className="rounded-md p-1.5 text-neutral-400 hover:bg-white/10 hover:text-red-300"
-                  aria-label={`Remove ${label}`}
+                  className="rounded-md p-1.5 text-zinc-400 hover:bg-red-50 hover:text-red-600"
+                  aria-label={t("ariaRemove", { name: label })}
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
@@ -1452,22 +1998,22 @@ function BuildingPicker({
           e.preventDefault();
           submit();
         }}
-        className="flex gap-2"
+        className="flex gap-1.5"
       >
         <input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="New building name"
-          className="h-10 min-w-0 flex-1 rounded-lg border border-white/15 bg-white/8 px-3 text-sm placeholder:text-neutral-500 focus:border-cyan-300 focus:outline-none"
+          placeholder={t("placeholderNewBuilding")}
+          className="h-9 min-w-0 flex-1 rounded-lg border border-zinc-200 bg-white px-2.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-[#fca311] focus:outline-none focus:ring-1 focus:ring-[#fca311]/45"
         />
         <button
           type="submit"
           disabled={!trimmed || !engineReady}
-          className="inline-flex h-10 items-center gap-1.5 rounded-lg bg-cyan-300 px-3 text-sm font-semibold text-neutral-950 disabled:opacity-50"
+          className="inline-flex h-9 shrink-0 items-center gap-1 rounded-lg bg-[#fca311] px-3 text-xs font-bold text-zinc-900 shadow-sm disabled:opacity-50"
         >
-          <Plus className="h-4 w-4" />
-          {exists ? "Open" : "Create"}
+          <Plus className="h-3.5 w-3.5 text-ar-navy" />
+          {exists ? t("open") : t("add")}
         </button>
       </form>
 
@@ -1475,9 +2021,9 @@ function BuildingPicker({
         <button
           type="button"
           onClick={onClearAll}
-          className="w-full rounded-lg border border-red-500/30 bg-red-500/10 py-1.5 text-xs font-medium text-red-200 hover:bg-red-500/15"
+          className="w-full rounded-lg border border-red-200 bg-red-50 py-1.5 text-[11px] font-semibold text-red-800 hover:bg-red-100"
         >
-          Clear all
+          {t("clearAll")}
         </button>
       )}
     </div>
@@ -1515,74 +2061,79 @@ function BuildingEditor({
   cameraReady: boolean;
   userLocation: UserLocation | null;
 }) {
+  const { t } = useI18n();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isBusy = capture !== null || addingPhotos !== null;
-  const captureDisabled = !engineReady || !cameraReady || isBusy;
-  const photoDisabled = !engineReady || isBusy;
+  const captureDisabled = !engineReady || !cameraReady || isBusy || isNegative;
+  const photoDisabled = !engineReady || isBusy || isNegative;
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <button
           type="button"
           onClick={onBack}
-          className="-ml-1 flex items-center gap-1 rounded-md px-1 py-1 text-xs text-neutral-300 hover:text-white"
+          className="-ml-1 flex items-center gap-1 rounded-md px-1 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900"
           disabled={isBusy}
         >
-          <ArrowLeft className="h-4 w-4" />
-          Buildings
+          <ArrowLeft className="h-4 w-4 text-ar-navy" />
+          {t("buildingsBack")}
         </button>
         <button
           type="button"
           onClick={() => onRemove(label)}
-          className="rounded-md p-1.5 text-neutral-400 hover:bg-white/10 hover:text-red-300 disabled:opacity-40"
-          aria-label={`Delete ${label}`}
+          className="rounded-md p-1.5 text-zinc-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
+          aria-label={t("ariaDelete", { name: label })}
           disabled={isBusy}
         >
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
 
-      <div className="rounded-lg bg-white/8 p-3">
-        <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Teaching</p>
-        <p className="mt-0.5 truncate text-base font-semibold">{label}</p>
-        <p className="mt-1 flex items-center gap-1.5 text-xs text-neutral-400">
+      <div className="rounded-lg border border-zinc-200 bg-white p-2.5">
+        <p className="text-[9px] font-semibold uppercase tracking-[0.18em] text-[#fca311]">
+          {t("teachingLabel")}
+        </p>
+        <p className="mt-0.5 truncate text-sm font-bold text-zinc-900">{label}</p>
+        <p className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-500">
           <span>
-            {count} sample{count === 1 ? "" : "s"}
+            {count} {count === 1 ? t("sampleOne") : t("sampleMany")}
           </span>
           {hasLocation ? (
-            <span className="inline-flex items-center gap-0.5 rounded-full bg-emerald-500/15 px-1.5 py-px text-[10px] text-emerald-200">
-              <MapPin className="h-2.5 w-2.5" />
-              GPS locked
+            <span className="inline-flex items-center gap-0.5 rounded-full bg-emerald-100 px-1.5 py-px text-[10px] font-medium text-emerald-900">
+              <MapPin className="h-2.5 w-2.5 text-ar-navy" />
+              {t("tagGps")}
             </span>
           ) : userLocation ? (
-            <span className="text-[10px] text-cyan-200">capture will save GPS</span>
+            <span className="text-[10px] text-[#fca311]">{t("gpsOnCapture")}</span>
           ) : (
-            <span className="text-[10px] text-amber-200">no GPS</span>
+            <span className="text-[10px] text-amber-800/80">{t("noGps")}</span>
           )}
         </p>
         {count < RECOMMENDED_SAMPLES_PER_BUILDING && (
-          <p className="mt-1 text-[10px] text-amber-200">
-            Add at least {RECOMMENDED_SAMPLES_PER_BUILDING} samples for stable recognition.
+          <p className="mt-1 text-[10px] text-zinc-500">
+            {t("teachSampleHint", { n: RECOMMENDED_SAMPLES_PER_BUILDING })}
           </p>
         )}
       </div>
 
       <label
-        className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 transition ${
-          isNegative ? "border-amber-300/55 bg-amber-300/10" : "border-white/12 bg-white/5"
-        }`}
+        className={cn(
+          "flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-2 transition",
+          isNegative
+            ? "border-[#fca311]/45 bg-[#ffc300]/20"
+            : "border-zinc-200 bg-white",
+        )}
       >
         <input
           type="checkbox"
           checked={isNegative}
           onChange={(e) => onToggleNegative(label, e.target.checked)}
-          className="h-4 w-4 shrink-0 rounded border-white/30 bg-neutral-950 text-amber-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300"
+          className="h-4 w-4 shrink-0 rounded border-ar-navy/30 text-[#fca311] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ar-navy"
         />
-        <span className="text-xs leading-snug text-neutral-200">
-          <span className="font-medium text-amber-100">Not building</span>
-          {" — "}
-          Recognize maps this tag to score 0.
+        <span className="text-[11px] leading-snug text-zinc-800">
+          <span className="font-bold text-[#fca311]">{t("notBuildingBold")}</span>
+          {t("notBuildingRest")}
         </span>
       </label>
 
@@ -1591,19 +2142,21 @@ function BuildingEditor({
           type="button"
           onClick={onCapture}
           disabled={captureDisabled}
-          className="flex h-14 flex-col items-center justify-center gap-0.5 rounded-lg bg-cyan-300 text-neutral-950 transition disabled:opacity-50"
+          className="flex h-12 flex-col items-center justify-center gap-0.5 rounded-lg bg-[#fca311] text-zinc-900 shadow-sm transition disabled:opacity-50"
         >
           {capture ? (
             <>
-              <Zap className="h-4 w-4" />
+              <Zap className="h-4 w-4 text-ar-navy" />
               <span className="text-xs font-semibold">
                 {capture.progress}/{FRAMES_PER_CAPTURE}
               </span>
             </>
           ) : (
             <>
-              <Camera className="h-4 w-4" />
-              <span className="text-xs font-semibold">Capture {FRAMES_PER_CAPTURE}</span>
+              <Camera className="h-4 w-4 text-ar-navy" />
+              <span className="text-xs font-semibold">
+                {t("captureN", { n: FRAMES_PER_CAPTURE })}
+              </span>
             </>
           )}
         </button>
@@ -1612,19 +2165,19 @@ function BuildingEditor({
           type="button"
           onClick={() => fileInputRef.current?.click()}
           disabled={photoDisabled}
-          className="flex h-14 flex-col items-center justify-center gap-0.5 rounded-lg border border-white/20 bg-white/8 transition hover:bg-white/12 disabled:opacity-50"
+          className="flex h-12 flex-col items-center justify-center gap-0.5 rounded-lg border border-zinc-200 bg-white text-zinc-900 shadow-sm transition hover:bg-zinc-50 disabled:opacity-50"
         >
           {addingPhotos ? (
             <>
-              <Zap className="h-4 w-4 text-cyan-300" />
-              <span className="text-xs font-semibold">
+              <Zap className="h-4 w-4 text-ar-navy" />
+              <span className="text-[11px] font-bold">
                 {addingPhotos.current}/{addingPhotos.total}
               </span>
             </>
           ) : (
             <>
-              <ImagePlus className="h-4 w-4 text-cyan-300" />
-              <span className="text-xs font-semibold">Add photos</span>
+              <ImagePlus className="h-4 w-4 text-ar-navy" />
+              <span className="text-[11px] font-bold">{t("photos")}</span>
             </>
           )}
         </button>
@@ -1643,9 +2196,8 @@ function BuildingEditor({
         }}
       />
 
-      <p className="rounded-lg border border-dashed border-white/15 bg-white/5 p-2 text-center text-[11px] text-neutral-400">
-        Tip: photo EXIF GPS is read automatically. Capturing on-site stamps the
-        building&apos;s location for AR labels.
+      <p className="rounded-lg border border-dashed border-zinc-200 bg-white p-2 text-center text-[10px] leading-snug text-zinc-500">
+        {t("exifHint")}
       </p>
     </div>
   );
@@ -1656,32 +2208,38 @@ function RecognizeContent({
   counts,
   nearby,
   hasGps,
-  minConfidence,
+  matchMinSimilarity,
+  onConfirmMatch,
+  onJoinDiscussion,
+  onReportIssue,
   onSwitchTeach,
 }: {
-  prediction: Prediction | null;
+  prediction: UiPrediction | null;
   counts: Record<string, number>;
   nearby: Positioned[];
   hasGps: boolean;
-  minConfidence: number;
+  matchMinSimilarity: number;
+  onConfirmMatch: (label: string) => void;
+  onJoinDiscussion: (label: string) => void;
+  onReportIssue: () => void;
   onSwitchTeach: () => void;
 }) {
+  const { t } = useI18n();
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   const labelCount = Object.keys(counts).length;
-  const isNoBuilding = prediction?.label === "No building";
 
   if (total === 0) {
     return (
-      <div className="flex flex-col items-center gap-2 py-2 text-center">
-        <Sparkles className="h-6 w-6 text-cyan-300" />
-        <p className="text-sm font-medium">No buildings taught yet</p>
-        <p className="text-xs text-neutral-400">Switch to Teach mode and add a building.</p>
+      <div className="flex flex-col items-center gap-3 px-2 py-8 text-center">
+        <Sparkles className="h-6 w-6 text-ar-navy" />
+        <p className="text-base font-bold text-zinc-900">{t("noBuildingsYet")}</p>
+        <p className="max-w-[280px] text-sm leading-relaxed text-zinc-500">{t("openTeachHint")}</p>
         <button
           type="button"
           onClick={onSwitchTeach}
-          className="mt-1 rounded-lg bg-cyan-300 px-3 py-1.5 text-xs font-semibold text-neutral-950"
+          className="mt-1 rounded-xl border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold text-zinc-900 shadow-sm"
         >
-          Go to Teach mode
+          {t("modeTeach")}
         </button>
       </div>
     );
@@ -1689,33 +2247,37 @@ function RecognizeContent({
 
   if (nearby.length > 0) {
     return (
-      <div className="space-y-1.5">
-        <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">In view</p>
+      <div className="space-y-1">
+        <p className="text-[9px] font-semibold uppercase tracking-[0.15em] text-[#fca311]">
+          {t("inView")}
+        </p>
         {nearby.map((b) => {
           const isMatch = prediction?.label === b.label;
           return (
             <div
               key={b.label}
-              className={`flex items-center justify-between gap-2 rounded-lg px-3 py-2 ${
+              className={cn(
+                "flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 ring-1",
                 isMatch
-                  ? "border border-cyan-300/50 bg-cyan-300/10"
-                  : "bg-white/5"
-              }`}
+                  ? "bg-[#ffc300]/25 ring-[#fca311]/40"
+                  : "bg-white ring-zinc-200",
+              )}
             >
               <div className="min-w-0">
                 <p
-                  className={`truncate text-sm font-semibold ${
-                    isMatch ? "text-cyan-100" : ""
-                  }`}
+                  className={cn(
+                    "truncate text-xs font-bold",
+                    isMatch ? "text-zinc-900" : "text-zinc-700",
+                  )}
                 >
                   {b.label}
                 </p>
-                <p className="text-[10px] text-neutral-400">{b.distance}m away</p>
+                <p className="text-[9px] text-zinc-500">{b.distance}m</p>
               </div>
-              <div className="text-right text-[10px] text-neutral-300">
+              <div className="text-right text-[9px] font-semibold text-zinc-600">
                 {isMatch && prediction
-                  ? `${Math.round(prediction.confidence * 100)}% match`
-                  : "scanning"}
+                  ? `${Math.round(prediction.confidence * 100)}%`
+                  : t("ellipsis")}
               </div>
             </div>
           );
@@ -1724,55 +2286,17 @@ function RecognizeContent({
     );
   }
 
-  if (!prediction) {
-    return (
-      <p className="py-3 text-center text-xs text-neutral-400">
-        {hasGps
-          ? "No taught buildings in range. Move closer or teach a new one."
-          : `Aim camera at a building... (${total} sample${total === 1 ? "" : "s"} across ${labelCount} building${labelCount === 1 ? "" : "s"})`}
-      </p>
-    );
-  }
-
-  if (isNoBuilding) {
-    return (
-      <div className="py-3 text-center">
-        <p className="text-sm font-semibold text-white">Show the building</p>
-        <p className="mt-1 text-xs text-neutral-400">Place the building in the frame.</p>
-      </div>
-    );
-  }
-
-  const ranked = Object.entries(prediction.confidences).sort(([, a], [, b]) => b - a);
-
   return (
-    <div className="space-y-2">
-      <div className="rounded-lg bg-white/8 p-3">
-        <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Top match</p>
-        <p className="mt-0.5 text-base font-semibold">{prediction.label}</p>
-        <div className="mt-1.5 h-1.5 rounded-full bg-white/15">
-          <div
-            className="h-full rounded-full bg-cyan-300 transition-[width] duration-200"
-            style={{ width: `${Math.round(prediction.confidence * 100)}%` }}
-          />
-        </div>
-        <p className="mt-1 text-[10px] text-neutral-400">
-          {`${Math.round(prediction.confidence * 100)}% confidence${prediction.isLowConfidence ? ` (below ${Math.round(minConfidence * 100)}% threshold)` : ""}`}
-        </p>
-      </div>
-      {ranked.length > 1 && (
-        <div className="space-y-1">
-          {ranked.slice(1, 4).map(([label, conf]) => (
-            <div
-              key={label}
-              className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-1.5 text-xs"
-            >
-              <span className="truncate text-neutral-300">{label}</span>
-              <span className="text-neutral-500">{Math.round(conf * 100)}%</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
+    <RecognizeMatchView
+      prediction={prediction}
+      totalSamples={total}
+      labelCount={labelCount}
+      hasGps={hasGps}
+      matchMinSimilarity={matchMinSimilarity}
+      onJoinDiscussion={onJoinDiscussion}
+      onReportIssue={onReportIssue}
+      onSwitchTeach={onSwitchTeach}
+      onConfirmTopMatch={onConfirmMatch}
+    />
   );
 }

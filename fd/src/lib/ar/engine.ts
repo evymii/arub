@@ -2,6 +2,8 @@ import * as tf from "@tensorflow/tfjs";
 import * as mobilenet from "@tensorflow-models/mobilenet";
 import * as knnClassifier from "@tensorflow-models/knn-classifier";
 
+import { drawVideoScanRoiToCanvas } from "@/lib/ar/video-scan-roi";
+
 let modelPromise: Promise<mobilenet.MobileNet> | null = null;
 
 function getModel() {
@@ -16,6 +18,8 @@ export type Prediction = {
   confidence: number;
   confidences: Record<string, number>;
   isLowConfidence?: boolean;
+  /** Best cosine similarity minus runner-up (0–1); larger ⇒ more distinct winner. */
+  margin?: number;
 };
 
 export type ImageSource = HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
@@ -38,7 +42,8 @@ export type Engine = {
   dispose: () => void;
 };
 
-const SIMILARITY_THRESHOLD = 0.65;
+/** Default gate for cosine similarity (same scale as confidence / 100%). */
+const SIMILARITY_THRESHOLD = 0.4;
 
 type CpuLabel = { label: string; vectors: Float32Array[]; norms: Float32Array };
 
@@ -71,7 +76,13 @@ export async function createEngine(): Promise<Engine> {
     return built;
   };
 
-  const embed = (source: ImageSource) => model.infer(source, true) as tf.Tensor;
+  const embed = (source: ImageSource) => {
+    if (source instanceof HTMLVideoElement) {
+      const roi = drawVideoScanRoiToCanvas(source);
+      if (roi) return model.infer(roi, true) as tf.Tensor;
+    }
+    return model.infer(source, true) as tf.Tensor;
+  };
   const extractEmbedding = (source: ImageSource): number[] => {
     const tensor = embed(source);
     try {
@@ -83,6 +94,17 @@ export async function createEngine(): Promise<Engine> {
 
   const totalExamples = () =>
     Object.values(classifier.getClassExampleCount()).reduce((a, b) => a + b, 0);
+
+  /**
+   * Robust per-label score:
+   * - 1 sample: use best cosine similarity.
+   * - 2 samples: still trust best (avoid over-penalizing small classes).
+   * - 3+ samples: lightly blend best and runner-up to reduce noisy spikes.
+   */
+  const robustLabelScore = (best: number, second: number, sampleCount: number): number => {
+    if (sampleCount <= 2) return best;
+    return best * 0.85 + second * 0.15;
+  };
 
   return {
     addExample(source, label) {
@@ -116,36 +138,51 @@ export async function createEngine(): Promise<Engine> {
 
         if (cpuCache === null) cpuCache = buildCache();
 
-        const perLabel: { label: string; bestSim: number }[] = [];
+        const perLabel: { label: string; score: number }[] = [];
         for (const entry of cpuCache) {
           if (allowedLabels && !allowedLabels.has(entry.label)) continue;
           let bestSim = -1;
+          let secondSim = -1;
           for (let i = 0; i < entry.vectors.length; i++) {
             const v = entry.vectors[i];
             const vNorm = entry.norms[i];
             let dot = 0;
             for (let j = 0; j < v.length; j++) dot += v[j] * queryData[j];
             const sim = dot / (qNorm * vNorm);
-            if (sim > bestSim) bestSim = sim;
+            if (sim > bestSim) {
+              secondSim = bestSim;
+              bestSim = sim;
+            } else if (sim > secondSim) {
+              secondSim = sim;
+            }
           }
-          perLabel.push({ label: entry.label, bestSim });
+          const score = robustLabelScore(
+            bestSim,
+            secondSim < 0 ? bestSim : secondSim,
+            entry.vectors.length,
+          );
+          perLabel.push({ label: entry.label, score });
         }
 
-        perLabel.sort((a, b) => b.bestSim - a.bestSim);
+        perLabel.sort((a, b) => b.score - a.score);
         const best = perLabel[0];
         if (!best) return null;
 
+        const second = perLabel[1]?.score ?? 0;
+        const margin = Math.max(0, best.score - second);
+
         const confidences: Record<string, number> = {};
         for (const item of perLabel) {
-          confidences[item.label] = Math.max(0, Math.min(1, item.bestSim));
+          confidences[item.label] = Math.max(0, Math.min(1, item.score));
         }
-        const confidence = Math.max(0, Math.min(1, best.bestSim));
-        if (best.bestSim < minConfidence && !options?.returnBestEffort) return null;
+        const confidence = Math.max(0, Math.min(1, best.score));
+        if (best.score < minConfidence && !options?.returnBestEffort) return null;
         return {
           label: best.label,
           confidence,
           confidences,
-          isLowConfidence: best.bestSim < minConfidence,
+          isLowConfidence: confidence < minConfidence,
+          margin,
         };
       } finally {
         eTensor.dispose();

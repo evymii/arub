@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "NODE_OPTIONS='--max-old-space-size=1536' next dev --webpack",
+    "dev:3000": "NODE_OPTIONS='--max-old-space-size=1536' PORT=3000 next dev --webpack",
+    "dev:3001": "NODE_OPTIONS='--max-old-space-size=1536' PORT=3001 next dev --webpack",
+    "dev:3002": "NODE_OPTIONS='--max-old-space-size=1536' PORT=3002 next dev --webpack",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
@@ -22,6 +25,7 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",
+    "@google/model-viewer": "^4.2.0",
     "@tensorflow-models/knn-classifier": "^1.2.6",
     "@tensorflow-models/mobilenet": "^2.1.1",
     "@tensorflow/tfjs": "^4.22.0",

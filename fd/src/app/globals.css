@@ -5,6 +5,9 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
+  --color-ar-navy: #0b2d72;
+  --color-ar-orange: #fca311;
+  --color-ar-yellow: #ffc300;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --font-sans: Arial, Helvetica, sans-serif;
