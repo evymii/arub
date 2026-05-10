@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:4000": "PORT=4000 tsx watch src/index.ts",
+    "dev:4001": "PORT=4001 tsx watch src/index.ts",
+    "dev:4002": "PORT=4002 tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc --noEmit",
     "lint": "eslint .",

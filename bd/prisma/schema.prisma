@@ -15,6 +15,10 @@ model User {
 
   buildings    Building[]
   samples      Sample[]
+  issues       Issue[]
+  issueMatches IssueMatch[]
+  issueSupports IssueSupport[]
+  issueComments IssueComment[]
 }
 
 model Building {
@@ -22,12 +26,16 @@ model Building {
   name        String   @unique
   lat         Float?
   lng         Float?
+  /** Taught as “not a building” — excluded from recognition sync / matching. */
+  isNotBuilding Boolean  @default(false)
   createdAt   DateTime @default(now())
 
   createdBy   User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
   createdById String?
 
   samples     Sample[]
+  issues      Issue[]
+  issueMatches IssueMatch[]
 
   @@index([lat, lng])
 }
@@ -50,5 +58,74 @@ model Sample {
   createdAt     DateTime @default(now())
 
   @@index([buildingId])
+  @@index([userId])
+}
+
+model Issue {
+  id            String   @id @default(cuid())
+  buildingId    String?
+  building      Building? @relation(fields: [buildingId], references: [id], onDelete: SetNull)
+  title         String
+  description   String?
+  status        String   @default("open") // open | consensus | accepted | resolved
+  matchCount    Int      @default(0)
+  uniqueUsers   Int      @default(0)
+  embedding     String?  // JSON-encoded float[]
+  photoUrl      String?
+  photoPublicId String?
+  lat           Float?
+  lng           Float?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  createdById   String
+  createdBy     User     @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  matches       IssueMatch[]
+  supports      IssueSupport[]
+  comments      IssueComment[]
+
+  @@index([buildingId])
+  @@index([status])
+  @@index([createdById])
+}
+
+model IssueMatch {
+  id          String   @id @default(cuid())
+  issueId     String
+  issue       Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  buildingId  String
+  building    Building @relation(fields: [buildingId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@index([issueId])
+  @@index([buildingId])
+  @@index([userId])
+}
+
+model IssueSupport {
+  id        String   @id @default(cuid())
+  issueId   String
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([issueId, userId])
+  @@index([issueId])
+}
+
+model IssueComment {
+  id        String   @id @default(cuid())
+  issueId   String
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  body      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([issueId])
   @@index([userId])
 }
